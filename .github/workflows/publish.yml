@@ -1,0 +1,35 @@
+name: publish
+
+# Pushing a tag vX.Y.Z publishes that version to npm through Trusted Publishing (OIDC): no npm token is
+# stored anywhere, and npm attaches provenance linking the package to this workflow run.
+# Setup and the manual first release: docs/RELEASING.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # OIDC for npm Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: npm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24 # npm 11.5+ is required for Trusted Publishing
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install -g npm@^11.5.1 # Trusted Publishing needs npm >= 11.5.1
+      - run: npm ci
+      - run: npm test
+      - name: Tag must match package.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="v$(node -p 'require("./package.json").version')"
+          if [[ "$TAG" != "$version" ]]; then echo "::error::tag $TAG != package.json $version"; exit 1; fi
+      - run: npm publish

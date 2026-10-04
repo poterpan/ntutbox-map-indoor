@@ -1,0 +1,89 @@
+/* Indoor map engine styles. Everything is scoped to the container (.indoor-map, added by
+   createIndoorMap) so generic names such as .label cannot leak into or out of the host page.
+   --blue can be overridden by the host. */
+.indoor-map { position: relative; overflow: hidden; --im-blue: var(--blue, #0a84ff); }
+.indoor-map canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+.indoor-map canvas:active { cursor: grabbing; }
+.indoor-map .floor-rail {
+  position: absolute; right: 14px; top: 72px; z-index: 5; display: flex; flex-direction: column; gap: 5px;
+  max-height: calc(100% - 170px); overflow-y: auto; padding: 5px; background: rgba(255,255,255,.74);
+  border-radius: 15px; backdrop-filter: blur(18px);
+}
+.indoor-map .floor-button {
+  min-width: 46px; height: 36px; border: 0; border-radius: 10px; background: transparent; color: #8b8f98;
+  font-weight: 720; cursor: pointer; position: relative; padding: 0 8px;
+}
+.indoor-map .floor-button.active { color: white; background: var(--im-blue); }
+.indoor-map .label {
+  position: absolute; transform: translate(-50%, -50%); pointer-events: none; z-index: 2; color: #323640;
+  font-size: 12px; font-weight: 780; text-shadow: 0 1px 1px rgba(255,255,255,.86);
+}
+.indoor-map .label.available { color: #154d25; }
+.indoor-map .label.soon { color: #6f5000; }
+.indoor-map .label.building { font-size: 11px; color: #616670; font-weight: 700; }
+.indoor-map .label.selected-building { color: #006ce0; font-weight: 820; font-size: 13px; }
+.indoor-map .label.poi {
+  color: #2566b5; background: rgba(255,255,255,.90); border: 1px solid rgba(72,111,166,.16);
+  border-radius: 8px; padding: 3px 6px; font-size: 9px; font-weight: 760;
+  box-shadow: 0 4px 12px rgba(39,57,87,.08); text-shadow: none;
+}
+/* v0.4: exploded-floor badges */
+.indoor-map .label.floor-badge {
+  pointer-events: auto;
+  cursor: pointer;
+  min-width: 92px;
+  padding: 6px 9px;
+  border-radius: 10px;
+  background: rgba(255,255,255,.92);
+  border: 1px solid rgba(88,94,107,.12);
+  box-shadow: 0 7px 20px rgba(37,44,66,.10);
+  text-shadow: none;
+  font-size: 10px;
+  font-weight: 780;
+  text-align: center;
+}
+.indoor-map .label.floor-badge.open { color: #218b3d; border-color: rgba(61,170,88,.25); }
+.indoor-map .label.floor-badge.partial { color: #916a10; border-color: rgba(199,157,55,.26); }
+.indoor-map .label.floor-badge.full { color: #777d87; border-color: rgba(120,126,136,.20); }
+@media (max-width: 760px) {
+  .indoor-map .label.floor-badge { min-width: 74px; padding: 5px 7px; font-size: 9px; }
+}
+/* ?debug camera tuning panel (temporary) */
+.indoor-map-debug {
+  position: fixed; right: 12px; bottom: 12px; z-index: 50; width: 250px; padding: 10px 12px;
+  border-radius: 12px; background: rgba(20,22,28,.86); color: #e9ecf2; font: 11px/1.5 ui-monospace, monospace;
+}
+.indoor-map-debug label { display: grid; grid-template-columns: 52px 1fr 34px; align-items: center; gap: 6px; }
+.indoor-map-debug pre { margin: 6px 0 0; white-space: pre-wrap; color: #9fd0ff; }
+/* Badge anchors at the slab's west edge and extends left of it. */
+.indoor-map .label.floor-badge { transform: translate(-100%, -50%); transition: box-shadow .15s ease, transform .15s ease; }
+.indoor-map .label.floor-badge.hover { box-shadow: 0 0 0 2px var(--im-blue), 0 7px 20px rgba(37,44,66,.14); transform: translate(-100%, -50%) scale(1.04); }
+/* Floor rail "全部" returns to the floor overview */
+.indoor-map .floor-button.all { font-size: 12px; color: var(--im-blue); border-bottom: 1px solid rgba(0,0,0,.06); border-radius: 10px 10px 4px 4px; }
+.indoor-map .label { transition: opacity .12s linear; }
+.indoor-map .compass {
+  position: absolute; right: 16px; bottom: 18px; z-index: 6; width: 44px; height: 44px; border: 0; border-radius: 50%;
+  background: rgba(255,255,255,.92); box-shadow: 0 8px 24px rgba(36,44,72,.14); cursor: pointer;
+  display: grid; place-items: center; transition: opacity .2s ease;
+}
+.indoor-map .compass.hidden { opacity: 0; pointer-events: none; }
+.indoor-map .compass .dial { position: relative; width: 30px; height: 30px; display: grid; place-items: center; transition: transform .05s linear; }
+.indoor-map .compass .dial i { position: absolute; top: -1px; font-style: normal; color: #ff3b30; font-size: 10px; line-height: 1; }
+.indoor-map .compass .dial b { font-size: 11px; font-weight: 800; color: #4d525c; margin-top: 6px; display: block; }
+.indoor-map .floor-button.empty { color: #b9bcc4; font-weight: 600; }
+.indoor-map .floor-button.active.empty { color: #fff; }
+.indoor-map .label.floor-skip {
+  transform: translate(-100%, -50%); font-size: 9px; font-weight: 650; color: #9a9ea8; text-shadow: none;
+  padding: 2px 8px; border-radius: 8px; border: 1px dashed rgba(120,126,136,.35); background: rgba(255,255,255,.6); white-space: nowrap;
+}
+.indoor-map .compass:not(.rotated):not(.hidden) { opacity: .78; }
+.indoor-map .label.entrance {
+  color: #fff; background: #3a3f4a; border-radius: 8px; padding: 3px 8px; font-size: 10px; font-weight: 760;
+  text-shadow: none; box-shadow: 0 4px 12px rgba(20,24,34,.18);
+}
+/* The campus card occupies the bottom edge; lift the compass above it. */
+.indoor-map .compass { transition: opacity .2s ease, bottom .18s ease; }
+/* v0.7: timetable vocabulary, unknown status, period picker */
+.indoor-map .label.unknown { color: #9aa0aa; font-weight: 650; }
+/* Overview: the floor that is big enough to enter lights up before a further zoom-in enters it. */
+.indoor-map .label.floor-badge.ready { box-shadow: 0 0 0 2px var(--im-blue), 0 7px 20px rgba(37,44,66,.14); color: var(--im-blue); }
