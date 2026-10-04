@@ -1,8 +1,9 @@
 name: publish
 
-# Pushing a tag vX.Y.Z publishes that version to npm through Trusted Publishing (OIDC): no npm token is
-# stored anywhere, and npm attaches provenance linking the package to this workflow run.
-# Setup and the manual first release: docs/RELEASING.md.
+# Pushing a tag vX.Y.Z stages that version on npm through Trusted Publishing (OIDC): no npm token is stored
+# anywhere, and provenance links the package to this workflow run. The trusted publisher may only *stage*;
+# the version goes public when a maintainer approves it on npmjs.com (Staged Packages) with 2FA.
+# A compromised repo or CI can therefore not ship a release by itself. Details: docs/RELEASING.md.
 on:
   push:
     tags: ["v*"]
@@ -20,10 +21,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 24 # npm 11.5+ is required for Trusted Publishing
+          node-version: 24
           registry-url: https://registry.npmjs.org
           cache: npm
-      - run: npm install -g npm@^11.5.1 # Trusted Publishing needs npm >= 11.5.1
+      - run: npm install -g npm@^11.15.0 # npm stage needs >= 11.15.0
       - run: npm ci
       - run: npm test
       - name: Tag must match package.json
@@ -32,4 +33,5 @@ jobs:
         run: |
           version="v$(node -p 'require("./package.json").version')"
           if [[ "$TAG" != "$version" ]]; then echo "::error::tag $TAG != package.json $version"; exit 1; fi
-      - run: npm publish
+      - name: Stage on npm (approve on npmjs.com → Staged Packages)
+        run: npm stage publish --provenance
