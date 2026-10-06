@@ -28,9 +28,16 @@ export interface CampusData {
   buildingIndex: { buildings: BuildingIndexEntry[] };
   /** Campus footprints; properties: buildingId, name, campusId. */
   buildingsData: FeatureCollection<Polygon | MultiPolygon>;
-  buildings: Record<string, BuildingConfig> | null;
+  /** Every building with indoor data; the default config for options.buildings. */
+  buildings: Record<string, BuildingConfig>;
   frameInfo?: { crs: string; origin: [number, number]; unit: string };
   [extra: string]: unknown;
+}
+
+/** What campusCdnSource().load() adds: the published pointer and manifest. */
+export interface CdnCampusData extends CampusData {
+  current: { schema_version: number; revision: number; manifest: string; update_sequence?: number | null; [extra: string]: unknown };
+  manifest: { files: Record<string, { path: string; [extra: string]: unknown }>; [extra: string]: unknown };
 }
 
 /** Where campus data comes from. campusCdnSource() is the default; any object of this shape works. */
@@ -41,7 +48,7 @@ export interface CampusSource {
 }
 
 export const CAMPUS_SCHEMA_VERSION: number;
-export function campusCdnSource(baseUrl?: string, options?: { fetch?: typeof fetch }): CampusSource & { frame: 'planar-cm' };
+export function campusCdnSource(baseUrl?: string, options?: { fetch?: typeof fetch }): CampusSource & { frame: 'planar-cm'; load(): Promise<CdnCampusData> };
 export function convertBuildings(doc: unknown): CampusData;
 export function convertFloor(doc: unknown): FeatureCollection<MultiPolygon>;
 
@@ -75,8 +82,10 @@ export interface OccupancyRecord {
   status: RoomStatus;
   [extra: string]: unknown;
 }
+/** What a host's occupancy records must have. Hosts usually pass their own record type as `O`. */
+export interface HasStatus { status: RoomStatus }
 /** Keyed "buildingId/floorId/classNumber". */
-export type Occupancy = Map<string, OccupancyRecord> | Record<string, OccupancyRecord>;
+export type Occupancy<O extends HasStatus = OccupancyRecord> = Map<string, O> | Record<string, O>;
 
 export interface Insets { top?: number; right?: number; bottom?: number; left?: number }
 
@@ -93,7 +102,7 @@ export interface ViewInfo {
   floors: FloorStats[];
 }
 
-export interface RoomInfo {
+export interface RoomInfo<O = OccupancyRecord> {
   key: string;
   buildingId: string;
   buildingName: string;
@@ -101,7 +110,8 @@ export interface RoomInfo {
   classNumber: string;
   gisName: string;
   status: RoomStatus;
-  occupancy: OccupancyRecord | null;
+  /** The host's record for this room, as passed in occupancy. */
+  occupancy: O | null;
 }
 
 export interface CampusFocus { buildingId: string; name: string; via: 'tap' | 'zoom' | 'return' }
@@ -116,11 +126,11 @@ export type ModelsError =
   | { type: 'models-frame-mismatch'; error: Error }
   | { type: 'model-failed'; buildings: string[] };
 
-export interface IndoorMapOptions {
+export interface IndoorMapOptions<O extends HasStatus = OccupancyRecord> {
   source?: CampusSource;
   /** Pass `(await source.load()).buildings`; without it only a three-building fallback is known. */
   buildings?: Record<string, BuildingConfig>;
-  occupancy?: Occupancy | null;
+  occupancy?: Occupancy<O> | null;
   initialBuilding?: string;
   initialView?: MapView;
   /** Building ids to fetch in the background. */
@@ -136,7 +146,7 @@ export interface IndoorMapOptions {
   models?: ModelSource | null;
 
   onViewChange?: (info: ViewInfo) => void;
-  onRoomSelect?: (room: RoomInfo | null) => void;
+  onRoomSelect?: (room: RoomInfo<O> | null) => void;
   onCampusFocus?: (focus: CampusFocus | null) => void;
   onError?: (error: MapError) => void;
   onLoading?: (info: { building: string }) => void;
@@ -145,14 +155,14 @@ export interface IndoorMapOptions {
   onModelsError?: (error: ModelsError) => void;
 }
 
-export interface IndoorMap {
+export interface IndoorMap<O extends HasStatus = OccupancyRecord> {
   /** Resolves once the first building is shown (or loading failed; see onError). */
   ready: Promise<void>;
   /** Resolves false when refused (destroyed, not started, or a flight in progress). */
   setView(view: { building?: string; view?: MapView; floor?: string | null; animate?: boolean }): Promise<boolean>;
   /** key = "buildingId/floorId/classNumber". Resolves false if the room has no polygon or the call was refused. */
   selectRoom(key: string, options?: { animate?: boolean }): Promise<boolean>;
-  setOccupancy(occupancy: Occupancy | null): void;
+  setOccupancy(occupancy: Occupancy<O> | null): void;
   enterBuilding(id: string): Promise<void>;
   resetView(): void;
   /** Host UI over the map changed size: re-read getInsets, keep the selected room visible. */
@@ -163,4 +173,4 @@ export interface IndoorMap {
 }
 
 /** Must run in the browser; throws when WebGL is unavailable. The engine adds its own element inside `container`. */
-export function createIndoorMap(container: HTMLElement, options?: IndoorMapOptions): IndoorMap;
+export function createIndoorMap<O extends HasStatus = OccupancyRecord>(container: HTMLElement, options?: IndoorMapOptions<O>): IndoorMap<O>;
