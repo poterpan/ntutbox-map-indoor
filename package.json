@@ -1,6 +1,6 @@
 {
   "name": "@ntutbox/map",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "北科盒子（NTUT Box）校園與室內地圖：2.5D 樓層圖、空教室著色、校園白模，讀取公開的校園資料 CDN",
   "license": "MIT",
   "author": "PoterPan",
@@ -10,16 +10,26 @@
   },
   "homepage": "https://github.com/poterpan/ntutbox-map#readme",
   "bugs": "https://github.com/poterpan/ntutbox-map/issues",
-  "keywords": ["ntut", "campus-map", "indoor-map", "threejs"],
+  "keywords": [
+    "ntut",
+    "campus-map",
+    "indoor-map",
+    "threejs"
+  ],
   "type": "module",
   "exports": {
-    ".": { "types": "./src/index.d.ts", "default": "./src/index.js" },
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
     "./style.css": "./src/engine/indoor-map.css",
     "./package.json": "./package.json"
   },
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
-  "sideEffects": ["*.css"],
+  "sideEffects": [
+    "*.css"
+  ],
   "files": [
     "src",
     "docs/DATA-FORMAT.md",
