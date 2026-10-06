@@ -1,14 +1,16 @@
-# @ntutbox/map
+# @ntutbox/map-indoor
 
 北科盒子（NTUT Box）的校園與室內地圖：2.5D 樓層圖、依課表的空教室著色、校園白模，以及三者之間的語意縮放。
 用 three.js 寫成，不綁定任何前端框架；資料讀北科盒子每週從學校公開 GIS 整理發布的 CDN。
 
-預計用在[北科排課](https://course.ntutbox.com/rooms/)的空教室頁，之後的校園導覽、導航與周邊店家也會建在這上面。
+用在[北科排課](https://course.ntutbox.com/rooms/)的空教室頁；室外的校園地圖（map.ntutbox.com）也用它做進入大樓後的室內圖。
+
+> 0.10 以前叫 `@ntutbox/map`（repo `ntutbox-map`），0.11 起改名，API 不變；`@ntutbox/map` 這個名字讓給室外地圖。
 
 ## 安裝
 
 ```bash
-npm install @ntutbox/map three
+npm install @ntutbox/map-indoor three
 ```
 
 three.js 是 peer dependency（`>=0.180.0`）。套件發布的是原始 ESM，由使用者的打包工具（Vite、Next.js 等）處理。
@@ -16,8 +18,8 @@ three.js 是 peer dependency（`>=0.180.0`）。套件發布的是原始 ESM，�
 ## 使用
 
 ```js
-import { createIndoorMap, campusCdnSource } from '@ntutbox/map';
-import '@ntutbox/map/style.css';
+import { createIndoorMap, campusCdnSource } from '@ntutbox/map-indoor';
+import '@ntutbox/map-indoor/style.css';
 
 const source = campusCdnSource();            // https://cdn.ntutbox.com/campus/v1
 const { buildings } = await source.load();   // 建物清單；引擎之後沿用同一份，不會重抓
@@ -60,7 +62,7 @@ CDN 只接受來自北科盒子網站的跨網域請求，並擋掉爬蟲。本�
 ### 3D 建物模型（選用）
 
 ```js
-import { campusModelSource } from '@ntutbox/map';
+import { campusModelSource } from '@ntutbox/map-indoor';
 createIndoorMap(el, { source, buildings, models: campusModelSource(), onModelsLoaded, onModelsError });
 ```
 

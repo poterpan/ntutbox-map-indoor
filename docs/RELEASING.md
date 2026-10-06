@@ -19,15 +19,17 @@ Trusted Publisher 只給了「stage」權限（不能直接 publish、不能改 
 
 ## 第一次發布（只做一次）
 
-Trusted Publishing 要在 npm 上「已存在的套件」設定，所以第一版手動發（2026-10-05 已完成 0.9.0）：
+Trusted Publishing 要在 npm 上「已存在的套件」設定，所以第一版手動發。`@ntutbox/map` 在 2026-10-05 發過 0.9.0；
+改名後的 `@ntutbox/map-indoor` 是新套件，2026-10-07 從 0.11.0 再走一次這段。手動發的版本之後補推同名 tag 留紀錄，
+workflow 看到版本已在 npm 上會直接跳過：
 
 1. `npm whoami` 確認登入，`npm org ls ntutbox` 確認是 owner。
 2. `npm pack --dry-run` 檢查會上傳的檔案（只該有 `src/`、`docs/DATA-FORMAT.md`、`docs/DESIGN.md`、README、LICENSE、package.json）。
 3. 在自己的終端機（不是 Claude Code 的 `!`，它不能互動）執行 `npm publish --auth-type=web`，用 passkey 在瀏覽器驗證。
    npm 會先放一個 `0.0.0-stage` 佔位版本，驗證後才發布真正的版本；之後把佔位版本 deprecate。
-4. 到 npmjs.com → `@ntutbox/map` → Settings → Trusted Publisher → GitHub Actions：
+4. 到 npmjs.com → `@ntutbox/map-indoor` → Settings → Trusted Publisher → GitHub Actions：
    - Organization or user：`poterpan`
-   - Repository：`ntutbox-map`
+   - Repository：`ntutbox-map-indoor`
    - Workflow filename：`publish.yml`
    - Environment：`npm`
    - Allowed actions：**都不勾**（只保留 `npm stage publish`）
