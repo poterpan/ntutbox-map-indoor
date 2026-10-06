@@ -1,7 +1,7 @@
 // Dev page (not part of the package): plays the role the course site's React page will play. It owns the page chrome (titles,
 // legend, period + building pickers, room sheet, campus card), computes occupancy from the course
 // timetable and pushes it into the engine through its public API only.
-import { createIndoorMap, campusCdnSource } from '../src/index.js';
+import { createIndoorMap, campusCdnSource, campusModelSource } from '../src/index.js';
 import '../src/engine/indoor-map.css';
 import { parsePeriods, pickTerm, resolveSlot, slotAt, buildOccupancy, summarizeBuildings } from './course-occupancy.js';
 import fixtureRooms from './fixtures/rooms-115-1.json';
@@ -63,7 +63,7 @@ function getInsets() {
   const visible = el => el && el.offsetParent !== null && getComputedStyle(el).display !== 'none' && !el.classList.contains('hidden');
   let top = 16, bottom = 16;
   for (const el of [$('.view-switch'), $('.floor-title')]) if (visible(el)) top = Math.max(top, el.getBoundingClientRect().bottom - r.top + 10);
-  if (visible($('.legend'))) bottom = Math.max(bottom, r.bottom - $('.legend').getBoundingClientRect().top + 10);
+  for (const el of [$('.legend'), $('#roomSheet')]) if (visible(el)) bottom = Math.max(bottom, r.bottom - el.getBoundingClientRect().top + 10);
   return { top, right: 16, bottom, left: 16 };
 }
 
@@ -114,7 +114,7 @@ function statusLine(rec) {
 
 function showRoomSheet(room) {
   const sheet = $('#roomSheet');
-  if (!room) { sheet.classList.add('hidden'); return; }
+  if (!room) { sheet.classList.add('hidden'); requestAnimationFrame(() => map.refreshInsets()); return; }
   const rec = room.occupancy;
   const kind = rec ? room.status : 'unknown';
   $('#sheetFloor').textContent = `${room.buildingName} ${room.floorId}`;
@@ -129,6 +129,8 @@ function showRoomSheet(room) {
   link.style.display = rec?.code ? '' : 'none';
   if (rec?.code) link.href = `${COURSE_SITE}/rooms/${rec.code}/`;
   sheet.classList.remove('hidden');
+  // the sheet now covers the bottom of the map: keep the room in sight
+  requestAnimationFrame(() => map.refreshInsets());
 }
 
 function showCampusCard(focus) {
@@ -170,6 +172,10 @@ const map = createIndoorMap(scene, {
   initialView: params.get('view') || 'overview',
   debug: params.has('debug'),
   getInsets,
+  // ?models=0 shows the plain white model
+  models: params.get('models') === '0' ? null : campusModelSource(),
+  onModelsError: e => console.warn('[dev] models', e),
+  onModelsLoaded: e => console.info('[dev] models', e),
   onViewChange: info => { view = info; renderChrome(); },
   onRoomSelect: showRoomSheet,
   onCampusFocus: showCampusCard,

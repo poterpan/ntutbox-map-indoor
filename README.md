@@ -27,7 +27,7 @@ const map = createIndoorMap(el, {
   buildings,                                  // { A3T: { name, short, entranceBearing } }；務必傳入，不傳只有內建的 3 棟備援
   occupancy,                                  // Map：'A3T/2F/201' → { status, … }，見下方
   initialBuilding: 'A3T', initialView: 'overview', // 'campus' | 'overview' | 'floor'
-  getInsets: () => ({ top, right, bottom, left }),  // 宿主 UI 蓋住的範圍（px）
+  getInsets: () => ({ top, right, bottom, left }),  // 宿主 UI 蓋住的範圍（px）；變了就呼叫 map.refreshInsets()
   onViewChange, onRoomSelect, onCampusFocus, onError, onLoading, onNotice,
 });
 
@@ -35,6 +35,7 @@ map.setOccupancy(new Map([['A3T/5F/505', { status: 'free', code: '62', capacity:
 await map.setView({ building: 'CB', view: 'floor', floor: '3F' }); // false = 被拒絕（飛行中等），之後重試
 await map.selectRoom('CB/3F/322');                                  // 清單點教室 → 地圖飛過去並選取
 map.enterBuilding('AM'); map.resetView(); map.clearSelection(); map.getView();
+map.refreshInsets();  // 底部面板升起等遮擋改變後：選中的教室被蓋住就平移回可見區，否則重新取景（使用者沒移動過時）
 map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 ```
 
@@ -44,7 +45,8 @@ map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 - 排課站怎麼把課表算成 `occupancy`，可以參考 [`dev/course-occupancy.js`](dev/course-occupancy.js)（它不在套件裡）。
 - 在 SSR 框架裡只能在瀏覽器端建立（例如 Next.js 用 `next/dynamic` 加 `ssr: false`）。import 模組本身不碰 `window`，SSR 安全。
 - 資料載入失敗走 `onError`；但瀏覽器不支援 WebGL 時 `createIndoorMap` 會直接拋錯，建立時請包 `try/catch` 並顯示替代內容（例如清單）。
-- 目前沒有 TypeScript 型別定義；TS 專案先用 `declare module '@ntutbox/map';`。
+- 附 TypeScript 型別（`src/index.d.ts`），選項、callback 參數與回傳的 API 都有型別。
+- 引擎在容器裡建立自己的 `.indoor-map` 元素並填滿容器，不改容器的 class 與樣式；宿主只要給容器一個尺寸（例如 `position: absolute; inset: 0` 或固定高度）。
 
 ### 資料來源
 
@@ -54,6 +56,21 @@ map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 | 自訂物件 | 任何有 `frame`、`load()`、`floor(id, floorId)` 的物件都能當 `source`，形狀見 `src/data/sources.js` 開頭 |
 
 CDN 只接受來自北科盒子網站的跨網域請求，並擋掉爬蟲。本機開發要走 proxy，見下方。
+
+### 3D 建物模型（選用）
+
+```js
+import { campusModelSource } from '@ntutbox/map';
+createIndoorMap(el, { source, buildings, models: campusModelSource(), onModelsLoaded, onModelsError });
+```
+
+- 校園視角裡有模型的建物改畫 Blender 模型（glTF），其餘照舊是白模；模型在背景載入，由校園中心往外，載完才替換，失敗的那棟留白模（`onModelsError`）。
+- 點選、聚焦、進入大樓都沿用白模的外框（隱藏、拉到模型高度），行為與沒有模型時相同。
+- 模型**不是公開資料**：放在 `models.ntutbox.com`，每個請求要帶宿主網站發的短效 token。`campusModelSource({ tokenUrl })`
+  向宿主的 `tokenUrl`（預設 `/api/model-token`）拿 `{ token, expiresAt, base }`，快到期自動換、遇到 401 換一次重試。
+  沒有這個端點的網站拿不到模型，地圖就維持白模。
+- 需要 `frame: 'planar-cm'` 的資料來源（`campusCdnSource` 就是）；模型依 EPSG:3826 形心擺放，glTF 的 Y-up 轉成引擎的 Z-up。
+- GLB 用 `KHR_mesh_quantization`，three.js 的 GLTFLoader 原生支援，不需要 WASM 解碼器。GLTFLoader 只在有給 `models` 時才動態載入。
 
 ## 狀態語意（依課表，不保證沒人）
 
@@ -89,3 +106,4 @@ npm test        # node --test：資料來源、課表轉換、樓層排序
 ## 授權
 
 程式碼採 [MIT](LICENSE)。CDN 上的校園空間資料源自國立臺北科技大學公開的 GIS，權利屬於校方，由北科盒子整理後提供，**不在 MIT 授權範圍內**。
+3D 建物模型是北科盒子的著作，保留所有權利，不開放下載、轉載或再利用（套件只含讀取它的程式碼，不含模型）。
