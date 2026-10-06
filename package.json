@@ -13,11 +13,12 @@
   "keywords": ["ntut", "campus-map", "indoor-map", "threejs"],
   "type": "module",
   "exports": {
-    ".": "./src/index.js",
+    ".": { "types": "./src/index.d.ts", "default": "./src/index.js" },
     "./style.css": "./src/engine/indoor-map.css",
     "./package.json": "./package.json"
   },
   "main": "./src/index.js",
+  "types": "./src/index.d.ts",
   "sideEffects": ["*.css"],
   "files": [
     "src",

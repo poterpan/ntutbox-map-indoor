@@ -63,7 +63,7 @@ function getInsets() {
   const visible = el => el && el.offsetParent !== null && getComputedStyle(el).display !== 'none' && !el.classList.contains('hidden');
   let top = 16, bottom = 16;
   for (const el of [$('.view-switch'), $('.floor-title')]) if (visible(el)) top = Math.max(top, el.getBoundingClientRect().bottom - r.top + 10);
-  if (visible($('.legend'))) bottom = Math.max(bottom, r.bottom - $('.legend').getBoundingClientRect().top + 10);
+  for (const el of [$('.legend'), $('#roomSheet')]) if (visible(el)) bottom = Math.max(bottom, r.bottom - el.getBoundingClientRect().top + 10);
   return { top, right: 16, bottom, left: 16 };
 }
 
@@ -114,7 +114,7 @@ function statusLine(rec) {
 
 function showRoomSheet(room) {
   const sheet = $('#roomSheet');
-  if (!room) { sheet.classList.add('hidden'); return; }
+  if (!room) { sheet.classList.add('hidden'); requestAnimationFrame(() => map.refreshInsets()); return; }
   const rec = room.occupancy;
   const kind = rec ? room.status : 'unknown';
   $('#sheetFloor').textContent = `${room.buildingName} ${room.floorId}`;
@@ -129,6 +129,8 @@ function showRoomSheet(room) {
   link.style.display = rec?.code ? '' : 'none';
   if (rec?.code) link.href = `${COURSE_SITE}/rooms/${rec.code}/`;
   sheet.classList.remove('hidden');
+  // the sheet now covers the bottom of the map: keep the room in sight
+  requestAnimationFrame(() => map.refreshInsets());
 }
 
 function showCampusCard(focus) {

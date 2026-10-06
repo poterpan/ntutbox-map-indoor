@@ -106,8 +106,11 @@ const COLORS = {
   selectedSide: 0x70a6df,
 };
 
-const root = container;
-root.classList.add('indoor-map'); // styles: src/engine/indoor-map.css (imported by the host)
+// The engine draws into its own element filling the host container, so it never changes the host's
+// classes or styles (the host keeps whatever position / size it gave the container).
+const root = document.createElement('div');
+root.className = 'indoor-map'; // styles: src/engine/indoor-map.css (imported by the host)
+container.appendChild(root);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(COLORS.bg);
 
@@ -1785,6 +1788,42 @@ function resetHeading() {
 // ---------------------------------------------------------------------------------------------
 
 let cachedInsets = null;
+
+// The host's overlays changed size (e.g. a bottom sheet rose over the map). Re-read them; bring the
+// selected room back into the visible area if the overlay now hides it, otherwise reframe the view
+// unless the user has moved it.
+function refreshInsets({ animate = true } = {}) {
+  if (destroyed || !started) return;
+  cachedInsets = safeInsets();
+  for (const entry of campusBuildings.values()) entry.fill1 = undefined; // visible area changed
+  if (isFlying()) return;
+  if (selectedRoom && currentView === 'floor3d' && revealSelectedRoom(animate)) return;
+  if (!viewState.userAdjusted && !tween) fitCurrent(animate);
+}
+
+const REVEAL_MARGIN_PX = 24;
+// Pan (no zoom or rotation) so the selected room's centre sits in the middle of the visible area.
+// Returns false when there is nothing to reveal, true when it is visible (already, or after the pan).
+function revealSelectedRoom(animate) {
+  const mesh = floors.get(selectedRoom.floorId)?.rooms.find(m => m.userData.key === selectedRoom.key);
+  if (!mesh) return false;
+  const c = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3());
+  const r = renderer.domElement.getBoundingClientRect(), inset = cachedInsets;
+  const p = c.clone().project(camera);
+  const sx = r.left + (p.x + 1) / 2 * r.width, sy = r.top + (1 - p.y) / 2 * r.height;
+  const left = r.left + inset.left, right = r.right - inset.right, top = r.top + inset.top, bottom = r.bottom - inset.bottom;
+  const m = REVEAL_MARGIN_PX;
+  if (sx >= left + m && sx <= right - m && sy >= top + m && sy <= bottom - m) return true;
+  const from = groundPoint(sx, sy, c.z), to = groundPoint((left + right) / 2, (top + bottom) / 2, c.z);
+  if (!from || !to) return false;
+  const target = viewState.target.clone();
+  target.x += from.x - to.x; target.y += from.y - to.y;
+  const adjusted = viewState.userAdjusted;
+  goToPose({ target, heading: viewState.heading, tilt: viewState.tilt, orthoHeight: viewState.orthoHeight, zoom: viewState.zoom }, animate);
+  viewState.userAdjusted = adjusted; // a pan to keep the room in sight is not a reframing
+  return true;
+}
+
 function updateChrome() {
   requestAnimationFrame(() => { if (!destroyed) cachedInsets = safeInsets(); });
   renderFloorRail();
@@ -2501,7 +2540,7 @@ function destroy() {
   compassEl.remove();
   root.querySelectorAll('.label').forEach(el => el.remove());
   debugEl?.remove();
-  root.classList.remove('indoor-map');
+  root.remove();
 }
 
 const ready = start();
@@ -2564,6 +2603,11 @@ return {
   enterBuilding: id => enterBuildingFromCampus(id),
   /** Back to the canonical framing of the current view. */
   resetView: () => fitCurrent(true),
+  /**
+   * Call when host UI over the map changes size (a bottom sheet expanding, a panel opening): re-reads
+   * getInsets and keeps the selected room visible, or reframes the view if the user has not moved it.
+   */
+  refreshInsets: ({ animate = true } = {}) => refreshInsets({ animate }),
   clearSelection: () => hideRoomSheet(),
   getView: () => viewInfo(),
   destroy,

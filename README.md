@@ -27,7 +27,7 @@ const map = createIndoorMap(el, {
   buildings,                                  // { A3T: { name, short, entranceBearing } }；務必傳入，不傳只有內建的 3 棟備援
   occupancy,                                  // Map：'A3T/2F/201' → { status, … }，見下方
   initialBuilding: 'A3T', initialView: 'overview', // 'campus' | 'overview' | 'floor'
-  getInsets: () => ({ top, right, bottom, left }),  // 宿主 UI 蓋住的範圍（px）
+  getInsets: () => ({ top, right, bottom, left }),  // 宿主 UI 蓋住的範圍（px）；變了就呼叫 map.refreshInsets()
   onViewChange, onRoomSelect, onCampusFocus, onError, onLoading, onNotice,
 });
 
@@ -35,6 +35,7 @@ map.setOccupancy(new Map([['A3T/5F/505', { status: 'free', code: '62', capacity:
 await map.setView({ building: 'CB', view: 'floor', floor: '3F' }); // false = 被拒絕（飛行中等），之後重試
 await map.selectRoom('CB/3F/322');                                  // 清單點教室 → 地圖飛過去並選取
 map.enterBuilding('AM'); map.resetView(); map.clearSelection(); map.getView();
+map.refreshInsets();  // 底部面板升起等遮擋改變後：選中的教室被蓋住就平移回可見區，否則重新取景（使用者沒移動過時）
 map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 ```
 
@@ -44,7 +45,8 @@ map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 - 排課站怎麼把課表算成 `occupancy`，可以參考 [`dev/course-occupancy.js`](dev/course-occupancy.js)（它不在套件裡）。
 - 在 SSR 框架裡只能在瀏覽器端建立（例如 Next.js 用 `next/dynamic` 加 `ssr: false`）。import 模組本身不碰 `window`，SSR 安全。
 - 資料載入失敗走 `onError`；但瀏覽器不支援 WebGL 時 `createIndoorMap` 會直接拋錯，建立時請包 `try/catch` 並顯示替代內容（例如清單）。
-- 目前沒有 TypeScript 型別定義；TS 專案先用 `declare module '@ntutbox/map';`。
+- 附 TypeScript 型別（`src/index.d.ts`），選項、callback 參數與回傳的 API 都有型別。
+- 引擎在容器裡建立自己的 `.indoor-map` 元素並填滿容器，不改容器的 class 與樣式；宿主只要給容器一個尺寸（例如 `position: absolute; inset: 0` 或固定高度）。
 
 ### 資料來源
 
