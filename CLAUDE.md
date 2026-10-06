@@ -1,4 +1,4 @@
-# ntutbox-map 規則
+# ntutbox-map-indoor 規則
 
 - **公開 repo。** 不放任何 GIS 原始資料或含個資的檔案（`using_member`、`property_member` 等）；資料一律從 CDN 讀（`src/data/sources.js`）。
 - 套件只含引擎與資料來源（`src/`）。宿主端邏輯（例如課表轉教室狀態）放在 `dev/` 當範例，不進套件。

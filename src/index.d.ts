@@ -1,4 +1,4 @@
-// Type definitions for @ntutbox/map. The runtime is plain JavaScript (src/index.js); keep these in step
+// Type definitions for @ntutbox/map-indoor. The runtime is plain JavaScript (src/index.js); keep these in step
 // with createIndoorMap's options, callbacks and returned API.
 import type { FeatureCollection, MultiPolygon, Polygon } from './geojson.js';
 

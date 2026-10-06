@@ -1,15 +1,15 @@
 {
-  "name": "@ntutbox/map",
-  "version": "0.10.0",
+  "name": "@ntutbox/map-indoor",
+  "version": "0.11.0",
   "description": "北科盒子（NTUT Box）校園與室內地圖：2.5D 樓層圖、空教室著色、校園白模，讀取公開的校園資料 CDN",
   "license": "MIT",
   "author": "PoterPan",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/poterpan/ntutbox-map.git"
+    "url": "git+https://github.com/poterpan/ntutbox-map-indoor.git"
   },
-  "homepage": "https://github.com/poterpan/ntutbox-map#readme",
-  "bugs": "https://github.com/poterpan/ntutbox-map/issues",
+  "homepage": "https://github.com/poterpan/ntutbox-map-indoor#readme",
+  "bugs": "https://github.com/poterpan/ntutbox-map-indoor/issues",
   "keywords": [
     "ntut",
     "campus-map",

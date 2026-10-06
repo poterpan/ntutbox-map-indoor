@@ -1,4 +1,4 @@
-// Minimal GeoJSON shapes used by @ntutbox/map (avoids a dependency on @types/geojson).
+// Minimal GeoJSON shapes used by @ntutbox/map-indoor (avoids a dependency on @types/geojson).
 export type Position = number[];
 export interface Polygon { type: 'Polygon'; coordinates: Position[][] }
 export interface MultiPolygon { type: 'MultiPolygon'; coordinates: Position[][][] }
