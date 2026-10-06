@@ -55,6 +55,21 @@ map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 
 CDN 只接受來自北科盒子網站的跨網域請求，並擋掉爬蟲。本機開發要走 proxy，見下方。
 
+### 3D 建物模型（選用）
+
+```js
+import { campusModelSource } from '@ntutbox/map';
+createIndoorMap(el, { source, buildings, models: campusModelSource(), onModelsLoaded, onModelsError });
+```
+
+- 校園視角裡有模型的建物改畫 Blender 模型（glTF），其餘照舊是白模；模型在背景載入，由校園中心往外，載完才替換，失敗的那棟留白模（`onModelsError`）。
+- 點選、聚焦、進入大樓都沿用白模的外框（隱藏、拉到模型高度），行為與沒有模型時相同。
+- 模型**不是公開資料**：放在 `models.ntutbox.com`，每個請求要帶宿主網站發的短效 token。`campusModelSource({ tokenUrl })`
+  向宿主的 `tokenUrl`（預設 `/api/model-token`）拿 `{ token, expiresAt, base }`，快到期自動換、遇到 401 換一次重試。
+  沒有這個端點的網站拿不到模型，地圖就維持白模。
+- 需要 `frame: 'planar-cm'` 的資料來源（`campusCdnSource` 就是）；模型依 EPSG:3826 形心擺放，glTF 的 Y-up 轉成引擎的 Z-up。
+- GLB 用 `KHR_mesh_quantization`，three.js 的 GLTFLoader 原生支援，不需要 WASM 解碼器。GLTFLoader 只在有給 `models` 時才動態載入。
+
 ## 狀態語意（依課表，不保證沒人）
 
 | 顏色 | 狀態 | 規則 |
@@ -89,3 +104,4 @@ npm test        # node --test：資料來源、課表轉換、樓層排序
 ## 授權
 
 程式碼採 [MIT](LICENSE)。CDN 上的校園空間資料源自國立臺北科技大學公開的 GIS，權利屬於校方，由北科盒子整理後提供，**不在 MIT 授權範圍內**。
+3D 建物模型是北科盒子的著作，保留所有權利，不開放下載、轉載或再利用（套件只含讀取它的程式碼，不含模型）。

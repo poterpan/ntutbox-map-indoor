@@ -54,12 +54,15 @@ const opts = {
   tapEmptyToExit: true,
   campusRadiusM: 250,      // campus white model: campus "A" plus indoor buildings within this radius
   getInsets: null,         // () => { top, right, bottom, left } px covered by host UI over the canvas
+  models: null,            // campusModelSource(): 3D building models replacing the white model where available
   ...options,
 };
 const BUILDINGS = opts.buildings;
 const source = opts.source ?? campusCdnSource();
 // Coordinates arrive either as WGS84 degrees or as integer cm in one planar frame (source.frame).
 const FRAME = source.frame ?? 'lonlat';
+// Models are placed by their EPSG:3826 centroid, so they need the planar frame and its published origin.
+const modelSource = opts.models ?? null;
 const emit = (name, payload) => {
   try { opts[name]?.(payload); } catch (err) { console.error(`[indoor-map] ${name} handler failed`, err); }
 };
@@ -268,8 +271,11 @@ function centroidOfGeometry(geometry, origin) {
 function clearGroup(group) {
   while (group.children.length) {
     const obj = group.children.pop();
+    // Campus models share their geometry with the cached template (cloned into every campus build);
+    // disposing it here would free buffers the next build still uses. Only their material copies go.
+    const shared = !!obj.userData?.model;
     obj.traverse?.(n => {
-      n.geometry?.dispose?.();
+      if (!shared) n.geometry?.dispose?.();
       if (Array.isArray(n.material)) n.material.forEach(m => m.dispose?.());
       else n.material?.dispose?.();
     });
@@ -684,12 +690,14 @@ let campusBlend = 0; // 1 = campus white model, 0 = inside a building; tweened w
 // Shared world origin for the campus model and every building, so the camera can fly between them.
 let WORLD_ORIGIN = null;
 let campusMats = []; // { m, base, kind: 'selected' | 'other' | 'ground', mesh }
-let campusBuildings = new Map(); // indoor buildingId -> { meshes, box, label }
+let campusBuildings = new Map(); // indoor buildingId -> { meshes, box, label, modelMats }
 let campusFocus = null; // { id, via: 'tap' | 'zoom' | 'return' } – highlighted building with its card
 let floorDataResolved = {};
 let lastCampusBlend = null, lastFloorVis = null;
 let campusLabels = [];
 let campusBuilt = false;
+let frameInfo = null;  // { crs, origin: [E, N] metres } of a planar-cm source
+let campusGen = 0;     // bumped on every campus (re)build; stale model loads check it and drop out
 
 const B = () => BUILDINGS[buildingId];
 
@@ -1156,7 +1164,7 @@ async function switchBuilding(id, { view = 'stacked', floor = null } = {}) { // 
   if (destroyed) return;
   buildingId = id;
   // Campus is rebuilt so the dissolving block is the new building.
-  clearGroup(campusGroup); campusLabels = []; campusMats = []; campusBuildings = new Map(); campusBuilt = false; lastCampusBlend = null;
+  clearGroup(campusGroup); campusLabels = []; campusMats = []; campusBuildings = new Map(); campusBuilt = false; lastCampusBlend = null; campusGen++;
   if (view !== 'keep') modeBlend = view === 'floor3d' ? 1 : 0;
   buildBuilding();
   if (view === 'keep') {
@@ -1219,7 +1227,7 @@ function createCampusBuilding(feature, origin) {
     const mats = materialPair(COLORS.campus, COLORS.campusSide);
     const mesh = new THREE.Mesh(geom, mats);
     mesh.castShadow = true; mesh.receiveShadow = true;
-    mesh.userData = { building: feature, selected };
+    mesh.userData = { building: feature, selected, height: h };
     campusGroup.add(mesh);
     if (entry) { entry.meshes.push(mesh); geom.computeBoundingBox(); entry.box.union(geom.boundingBox); }
     for (const m of mats) { m.transparent = true; campusMats.push({ m, base: 1, kind: selected ? 'selected' : 'other', mesh }); }
@@ -1274,6 +1282,124 @@ function buildCampus() {
   lastCampusBlend = null;
   rebuildLabels();
   applyCampusFocusStyle();
+  attachModels(++campusGen);
+}
+
+// ---- campus 3D models ----
+// A building with a model keeps its white-model extrusion, hidden, as the tap target (stretched to the
+// model's height), so picking, focus and entering work exactly as before. Without models — no source,
+// a lonlat source, or any load failure — the white model simply stays.
+const modelTemplates = new Map(); // id -> Promise<THREE.Object3D> parsed once, cloned into each campus build
+const MODEL_CONCURRENCY = 3;
+let gltfLoader = null;
+
+function modelTemplate(id) {
+  if (!modelTemplates.has(id)) {
+    const p = (async () => {
+      const [{ GLTFLoader }, buf] = await Promise.all([
+        import('three/addons/loaders/GLTFLoader.js'),
+        modelSource.glb(id),
+      ]);
+      gltfLoader ??= new GLTFLoader();
+      return (await gltfLoader.parseAsync(buf, '')).scene;
+    })();
+    p.catch(() => modelTemplates.delete(id));
+    modelTemplates.set(id, p);
+  }
+  return modelTemplates.get(id);
+}
+
+async function attachModels(gen) {
+  if (!modelSource || FRAME !== 'planar-cm' || !frameInfo?.origin) return;
+  let manifest;
+  try {
+    manifest = await modelSource.load();
+  } catch (error) {
+    emit('onModelsError', { type: 'models-unavailable', error });
+    return;
+  }
+  if (gen !== campusGen || destroyed) return;
+  if (manifest.crs !== frameInfo.crs) {
+    emit('onModelsError', { type: 'models-frame-mismatch', error: new Error(`${manifest.crs} ≠ ${frameInfo.crs}`) });
+    return;
+  }
+  // Nearest the campus centre first: the middle of the view fills in before the edges.
+  const ids = [...new Set(campusFeatures().map(f => f.properties.buildingId))].filter(id => manifest.buildings[id]);
+  const dist = id => {
+    const [x, y] = modelPosition(manifest.buildings[id].centroidEN);
+    return Math.hypot(x, y) - (id === campusFocus?.id ? 1e6 : 0);
+  };
+  ids.sort((a, b) => dist(a) - dist(b));
+  let loaded = 0;
+  const failed = [];
+  const worker = async () => {
+    for (let id; (id = ids.shift());) {
+      try {
+        const template = await modelTemplate(id);
+        if (gen !== campusGen || destroyed) return;
+        placeModel(id, template, manifest.buildings[id]);
+        loaded++;
+      } catch (error) {
+        failed.push(id);
+        console.warn(`[indoor-map] model ${id} failed; keeping the white model`, error);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: MODEL_CONCURRENCY }, worker));
+  if (gen !== campusGen || destroyed) return;
+  if (failed.length) emit('onModelsError', { type: 'model-failed', buildings: failed });
+  emit('onModelsLoaded', { loaded, failed });
+}
+
+// EPSG:3826 metres → world metres, through the same projection as every footprint.
+function modelPosition([e, n]) {
+  return project([(e - frameInfo.origin[0]) * 100, (n - frameInfo.origin[1]) * 100], WORLD_ORIGIN);
+}
+
+function placeModel(id, template, entry) {
+  const model = template.clone(true);
+  model.rotation.x = Math.PI / 2; // glTF is Y-up (x east, y up, z south); the engine is Z-up (x east, y north)
+  const wrap = new THREE.Group();
+  wrap.add(model);
+  const [x, y] = modelPosition(entry.centroidEN);
+  wrap.position.set(x, y, 0);
+  wrap.userData = { model: id };
+  const kind = id === buildingId ? 'selected' : 'other';
+  const own = new Map(); // shared glTF material -> this building's copy (fades and highlights per building)
+  const modelMats = [];
+  model.traverse(node => {
+    if (!node.isMesh) return;
+    node.castShadow = true; node.receiveShadow = true;
+    const copy = m => {
+      if (!own.has(m)) {
+        const c = m.clone();
+        c.transparent = true;
+        own.set(m, c);
+        campusMats.push({ m: c, base: c.opacity, kind, mesh: node });
+        modelMats.push({ m: c, emissive: c.emissive?.getHex() ?? 0, intensity: c.emissiveIntensity ?? 1 });
+      }
+      return own.get(m);
+    };
+    node.material = Array.isArray(node.material) ? node.material.map(copy) : copy(node.material);
+  });
+  campusGroup.add(wrap);
+  wrap.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(wrap);
+  const height = Math.max(1, box.max.z);
+  for (const mesh of campusGroup.children) {
+    if (mesh.userData.building?.properties.buildingId !== id) continue;
+    mesh.visible = false;
+    mesh.scale.z = height / (mesh.userData.height || height);
+  }
+  const indoor = campusBuildings.get(id);
+  if (indoor) {
+    indoor.box = box;
+    indoor.modelMats = modelMats;
+    if (indoor.label) indoor.label.local.setZ(height + 1.1);
+  }
+  lastCampusBlend = null; // apply the current fade to the new materials
+  campusBox = null;
+  applyCampusFocusStyle();
 }
 
 // ---- campus focus: highlight + card ----
@@ -1291,6 +1417,11 @@ function applyCampusFocusStyle() {
     for (const mesh of entry.meshes) {
       mesh.material[0].color.setHex(on ? COLORS.selected : COLORS.campus);
       mesh.material[1].color.setHex(on ? COLORS.selectedSide : COLORS.campusSide);
+    }
+    for (const { m, emissive, intensity } of entry.modelMats ?? []) {
+      if (!m.emissive) continue;
+      m.emissive.setHex(on ? COLORS.selected : emissive);
+      m.emissiveIntensity = on ? .45 : intensity;
     }
     if (entry.label?.el) entry.label.el.className = `label ${on ? 'selected-building' : 'building'}`;
   }
@@ -2322,13 +2453,13 @@ function setupDebugPanel() {
   };
   debugPanel = { sync };
   // Devtools access to internals, debug mode only.
-  window.__indoorDebug = { floors: () => floors, overviewBox, floorBoxAt, viewState, camera, boxScreenMetrics, overviewFloorIds, zoomOverviewAt };
+  window.__indoorDebug = { scene, renderer, sun, floors: () => floors, overviewBox, floorBoxAt, viewState, camera, boxScreenMetrics, overviewFloorIds, zoomOverviewAt };
 }
 
 async function start() {
   setupDebugPanel();
   try {
-    ({ buildingIndex, buildingsData } = await source.load());
+    ({ buildingIndex, buildingsData, frameInfo = null } = await source.load());
   } catch (error) {
     emit('onError', { type: 'load-failed', error });
     return;
@@ -2360,6 +2491,8 @@ function destroy() {
   clearTimeout(wheelIdleTimer);
   clearGroup(buildingGroup);
   clearGroup(campusGroup);
+  campusGen++;
+  for (const p of modelTemplates.values()) p.then(t => t.traverse(n => n.geometry?.dispose?.())).catch(() => {});
   renderer.dispose();
   renderer.forceContextLoss();
   renderer.domElement.remove();

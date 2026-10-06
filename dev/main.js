@@ -1,7 +1,7 @@
 // Dev page (not part of the package): plays the role the course site's React page will play. It owns the page chrome (titles,
 // legend, period + building pickers, room sheet, campus card), computes occupancy from the course
 // timetable and pushes it into the engine through its public API only.
-import { createIndoorMap, campusCdnSource } from '../src/index.js';
+import { createIndoorMap, campusCdnSource, campusModelSource } from '../src/index.js';
 import '../src/engine/indoor-map.css';
 import { parsePeriods, pickTerm, resolveSlot, slotAt, buildOccupancy, summarizeBuildings } from './course-occupancy.js';
 import fixtureRooms from './fixtures/rooms-115-1.json';
@@ -170,6 +170,10 @@ const map = createIndoorMap(scene, {
   initialView: params.get('view') || 'overview',
   debug: params.has('debug'),
   getInsets,
+  // ?models=0 shows the plain white model
+  models: params.get('models') === '0' ? null : campusModelSource(),
+  onModelsError: e => console.warn('[dev] models', e),
+  onModelsLoaded: e => console.info('[dev] models', e),
   onViewChange: info => { view = info; renderChrome(); },
   onRoomSelect: showRoomSheet,
   onCampusFocus: showCampusCard,
