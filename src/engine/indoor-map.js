@@ -1315,7 +1315,7 @@ async function attachModels(gen) {
   try {
     manifest = await modelSource.load();
   } catch (error) {
-    emit('onModelsError', { type: 'models-unavailable', error });
+    if (gen === campusGen && !destroyed) emit('onModelsError', { type: 'models-unavailable', error });
     return;
   }
   if (gen !== campusGen || destroyed) return;
@@ -1394,6 +1394,7 @@ function placeModel(id, template, entry) {
   const indoor = campusBuildings.get(id);
   if (indoor) {
     indoor.box = box;
+    indoor.fill1 = undefined; // its screen fill was measured against the white-model box
     indoor.modelMats = modelMats;
     if (indoor.label) indoor.label.local.setZ(height + 1.1);
   }

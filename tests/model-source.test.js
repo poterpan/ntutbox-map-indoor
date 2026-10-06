@@ -68,3 +68,17 @@ test('a refused token surfaces as an error and is not cached', async () => {
   await assert.rejects(src.load(), /model token 503/);
   await assert.rejects(src.load(), /model token 404/);
 });
+
+test('a device clock far ahead of the server does not loop on refresh', async () => {
+  const s = server();
+  let minted = 0;
+  const fetch = async (url, init) => {
+    if (url === '/api/model-token') minted++;
+    return s.fetch(url, init);
+  };
+  // server clock 1.8e9, device clock an hour ahead: expiresAt already looks past
+  const src = campusModelSource({ fetch, now: () => s.now() + 3600 });
+  await src.load();
+  await src.glb('A3T');
+  assert.equal(minted, 1);
+});

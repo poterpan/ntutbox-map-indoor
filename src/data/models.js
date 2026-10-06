@@ -8,6 +8,7 @@
 // tokenUrl answers { token, expiresAt (unix s), base } — see README「3D 建物模型」. Any object with load() and
 // glb() works as the engine's `models` option.
 export const MODELS_SCHEMA_VERSION = 1;
+const TOKEN_TTL_S = 600;     // models.ntutbox.com tokens live this long (shared with the minting site)
 const REFRESH_MARGIN_S = 60;
 
 export function campusModelSource({
@@ -26,10 +27,13 @@ export function campusModelSource({
       if (!res.ok) throw Object.assign(new Error(`model token ${res.status}`), { status: res.status });
       const body = await res.json();
       if (!body?.token || !body?.base || !Number.isFinite(body.expiresAt)) throw new Error('model token response is malformed');
-      return body;
+      // Refresh on the local clock from when we received it, not the server's expiresAt: a device clock
+      // that runs fast would otherwise see every fresh token as stale and loop. Real expiry → 401 retry.
+      return { ...body, refreshAt: now() + TOKEN_TTL_S - REFRESH_MARGIN_S };
     })();
-    grant.catch(() => { grant = null; });
-    return grant.then(g => (g.expiresAt - REFRESH_MARGIN_S <= now() ? token(true) : g));
+    const g = grant;
+    g.catch(() => { if (grant === g) grant = null; });
+    return g.then(v => (v.refreshAt <= now() ? token(true) : v));
   }
 
   // One retry with a fresh token on 401: a token can expire between minting and use (sleeping tab).
@@ -54,7 +58,8 @@ export function campusModelSource({
       if (manifest.crs !== 'EPSG:3826' || !manifest.buildings) throw new Error('campus models manifest is not in EPSG:3826');
       return manifest;
     })();
-    loaded.catch(() => { loaded = null; });
+    const l = loaded;
+    l.catch(() => { if (loaded === l) loaded = null; });
     return loaded;
   }
 
