@@ -1,0 +1,393 @@
+import * as THREE from 'three';
+import { allCoords } from '../data/frame.js';
+import { classifyFeature, roomKey, roomStatus } from '../data/indoor.js';
+
+// Geometry of one floor: extruded spaces, low room walls, slab, outlines and label anchors.
+// Everything here is in the world frame (Y-up metres); a floor is built at y = 0 and the layer moves its group.
+// Stage 3 (merged geometry, vertex colours) replaces the inside of this module; its output shape stays.
+
+export const DEFAULT_PALETTE = {
+  slabTop: 0xf8f8f7,
+  slabSide: 0xd9dde4,
+  room: 0xd2d6dd,
+  roomSide: 0xbac0c9,
+  free: 0x93dca4,
+  freeSide: 0x58bc72,
+  soon: 0xe8d27d,
+  soonSide: 0xc6a744,
+  unknown: 0xe6e8ec,
+  unknownSide: 0xccd0d7,
+  corridor: 0xf2ecdf,
+  corridorSide: 0xd9cdb8,
+  vertical: 0xc9dcef,
+  verticalSide: 0x9cbad7,
+  restroom: 0xdad6ee,
+  restroomSide: 0xb2abd4,
+  service: 0xe7e9ed,
+  serviceSide: 0xc9cdd5,
+  wall: 0xf6f7f9,
+  wallSide: 0xbfc5ce,
+  outline: 0x767c87,
+  focusEdge: 0x4f5560,
+  accent: 0x0a84ff,
+};
+
+export function statusColors(palette) {
+  return {
+    free: [palette.free, palette.freeSide],
+    soon: [palette.soon, palette.soonSide],
+    busy: [palette.room, palette.roomSide],
+    unknown: [palette.unknown, palette.unknownSide],
+  };
+}
+
+// Low walls: tall enough to read as rooms at the single-floor tilt, low enough not to hide the floor colour.
+export const WALL = { base: .18, height: .85, thickness: .14 };
+export const LABEL_Y = WALL.base + WALL.height + .2;
+export const SLAB_DEPTH = .7;
+
+// Shapes are drawn in the plan (x, north) and extruded along +Z; extrudeUp turns that into the world frame
+// (extrusion along +Y, north to −Z).
+export function shapeFromPoints(points, hole = false) {
+  const p = hole ? new THREE.Path() : new THREE.Shape();
+  points.forEach(([x, z], i) => (i ? p.lineTo(x, -z) : p.moveTo(x, -z)));
+  p.closePath();
+  return p;
+}
+export function extrudeUp(shape, options) {
+  return new THREE.ExtrudeGeometry(shape, options).rotateX(-Math.PI / 2);
+}
+
+export function ringsFromGeometry(geometry) {
+  if (geometry.type === 'Polygon') return [geometry.coordinates];
+  if (geometry.type === 'MultiPolygon') return geometry.coordinates;
+  return [];
+}
+
+export function shapeFromRings(rings, project) {
+  if (!rings?.length || rings[0].length < 3) return null;
+  const shape = shapeFromPoints(rings[0].map(pt => project(pt)));
+  for (let i = 1; i < rings.length; i++) shape.holes.push(shapeFromPoints(rings[i].map(pt => project(pt)), true));
+  return shape;
+}
+
+export function centroidOfGeometry(geometry, project) {
+  const pts = allCoords(geometry);
+  let sx = 0, sz = 0;
+  for (const p of pts) {
+    const [x, z] = project(p);
+    sx += x; sz += z;
+  }
+  return new THREE.Vector3(sx / pts.length, 0, sz / pts.length);
+}
+
+export function materialPair(top, side, { transparent = false, opacity = 1, fog = true } = {}) {
+  const a = new THREE.MeshStandardMaterial({ color: top, roughness: .90, metalness: 0, transparent, opacity });
+  const b = new THREE.MeshStandardMaterial({ color: side, roughness: .95, metalness: 0, transparent, opacity });
+  a.fog = b.fog = fog;
+  return [a, b];
+}
+
+export function convexHull(points) {
+  const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [], upper = [];
+  for (const p of pts) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
+  for (const p of pts.reverse()) { while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
+  return lower.slice(0, -1).concat(upper.slice(0, -1));
+}
+
+// Free every geometry and material under `obj` (the object itself included).
+export function disposeTree(obj) {
+  obj.traverse(n => {
+    n.geometry?.dispose?.();
+    if (Array.isArray(n.material)) n.material.forEach(m => m.dispose?.());
+    else n.material?.dispose?.();
+  });
+}
+
+// ---- walls ----
+const WALL_ANGLE_TOL = .05, WALL_OFFSET_TOL = .3, WALL_MIN_LEN = .12;
+// Room outlines in the GIS data notch around every column (most 5F edges are < 0.5 m). The floor fill
+// keeps the exact polygon; only the wall outline is cleaned: keep the long edges (each one lies exactly
+// on a GIS edge), merge collinear pieces split by a notch, and re-form corners where neighbours meet.
+const WALL_MIN_EDGE_M = 1.0, WALL_MERGE_ANGLE = .17, WALL_MERGE_OFFSET_M = 1.0, WALL_CORNER_MAX_M = 3;
+
+function subtractInterval(parts, [c0, c1]) {
+  return parts.flatMap(([a, b]) => {
+    if (c1 <= a || c0 >= b) return [[a, b]];
+    return [[a, Math.min(b, c0)], [Math.max(a, c1), b]].filter(([x, y]) => y - x > WALL_MIN_LEN);
+  });
+}
+
+export function cleanWallOutline(ring) {
+  const pts = ring.slice(0, -1);
+  const lines = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (len >= WALL_MIN_EDGE_M) lines.push({ a, b, len, dir: [(b[0] - a[0]) / len, (b[1] - a[1]) / len] });
+  }
+  const sameLine = (l, m) => {
+    const dot = l.dir[0] * m.dir[0] + l.dir[1] * m.dir[1];
+    if (dot < Math.cos(WALL_MERGE_ANGLE)) return false;
+    const off = Math.abs((m.a[0] - l.a[0]) * l.dir[1] - (m.a[1] - l.a[1]) * l.dir[0]);
+    return off < WALL_MERGE_OFFSET_M;
+  };
+  // Merge runs of collinear edges (cyclically); the longest piece defines the line.
+  const merged = [];
+  for (const l of lines) {
+    const last = merged[merged.length - 1];
+    if (last && sameLine(last.ref, l)) { last.b = l.b; if (l.len > last.ref.len) last.ref = l; }
+    else merged.push({ a: l.a, b: l.b, ref: l });
+  }
+  if (merged.length > 1 && sameLine(merged[0].ref, merged[merged.length - 1].ref)) {
+    const first = merged.shift(), last = merged[merged.length - 1];
+    last.b = first.b; if (first.ref.len > last.ref.len) last.ref = first.ref;
+  }
+  if (merged.length < 3) return ring;
+  const intersect = (l, m) => {
+    const [p, r] = [l.ref.a, l.ref.dir], [q, t] = [m.ref.a, m.ref.dir];
+    const den = r[0] * t[1] - r[1] * t[0];
+    if (Math.abs(den) < 1e-6) return null;
+    const u = ((q[0] - p[0]) * t[1] - (q[1] - p[1]) * t[0]) / den;
+    return [p[0] + r[0] * u, p[1] + r[1] * u];
+  };
+  const out = [];
+  for (let i = 0; i < merged.length; i++) {
+    const l = merged[i], m = merged[(i + 1) % merged.length];
+    let c = intersect(l, m);
+    // Nearly parallel neighbours intersect absurdly far away (HR 4F/7F produced a 224 km wall). A corner
+    // is only a corner if it lies near both edges' original ends; otherwise join those ends directly.
+    if (c && (Math.hypot(c[0] - l.b[0], c[1] - l.b[1]) > WALL_CORNER_MAX_M || Math.hypot(c[0] - m.a[0], c[1] - m.a[1]) > WALL_CORNER_MAX_M)) c = null;
+    // Parallel neighbours with a real step between them: keep both original endpoints.
+    if (c) out.push(c); else out.push(l.b, m.a);
+  }
+  out.push(out[0]);
+  return out;
+}
+
+// Builds one floor into a fresh group at y = 0. Returns the floor record the layer animates.
+//   ctx: { buildingId, floorId, index, features, occupancy, project, palette, fog, receiveShadow,
+//          footprintFeature, footprintM }
+export function buildFloor(ctx) {
+  const { floorId: id, features, occupancy, project, palette: COLORS, fog, receiveShadow } = ctx;
+  const STATUS = statusColors(COLORS);
+  const group = new THREE.Group();
+  group.userData.floorId = id;
+  const floor = {
+    id, index: ctx.index, group, slab: null, hull: null,
+    rooms: [], hitMeshes: [], drawables: [], walls: [], wallScale: null, labels: [], mats: [], casters: [], spaceEdges: [],
+    fade: 0, fadeTarget: 0, outline: null, outlineFade: 0, outlineTarget: 0, focusEdge: null, focusStyleK: undefined,
+    localBox: null, badge: null,
+  };
+  const classify = p => classifyFeature(p, occupancy);
+  const lineMat = params => { const m = new THREE.LineBasicMaterial(params); m.fog = fog; return m; };
+
+  // Walls already built on this floor, as collinear intervals. Adjacent rooms share boundaries, so without
+  // this every shared edge would get two overlapping walls.
+  const floorWalls = [];
+  const addWallSegment = (x1, z1, x2, z2) => {
+    const dx = x2 - x1, dz = z2 - z1;
+    const len = Math.hypot(dx, dz);
+    if (len < .08) return;
+    const geom = new THREE.BoxGeometry(len, WALL.height, WALL.thickness);
+    const mat = new THREE.MeshStandardMaterial({ color: COLORS.wallSide, roughness: .95, metalness: 0 });
+    mat.fog = fog;
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.position.set((x1 + x2) / 2, WALL.base + WALL.height / 2, (z1 + z2) / 2);
+    mesh.rotation.y = -Math.atan2(dz, dx);
+    mesh.receiveShadow = receiveShadow;
+    mesh.userData = { wall: true, caster: true, floorId: id };
+    group.add(mesh);
+  };
+  // Plan coordinates (x, north) in; walls are placed at world (x, −north).
+  const addDedupedWall = (ax, ay, bx, by) => {
+    let ang = Math.atan2(by - ay, bx - ax);
+    if (ang < 0) ang += Math.PI;
+    if (ang >= Math.PI) ang -= Math.PI;
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    const off = -ax * dy + ay * dx;
+    const t0 = Math.min(ax * dx + ay * dy, bx * dx + by * dy);
+    const t1 = Math.max(ax * dx + ay * dy, bx * dx + by * dy);
+    let parts = [[t0, t1]];
+    for (const w of floorWalls) {
+      const diff = Math.abs(w.ang - ang);
+      // Angles near 0 and near π are the same line with flipped direction.
+      const flipped = diff > Math.PI / 2;
+      if (Math.min(diff, Math.PI - diff) > WALL_ANGLE_TOL) continue;
+      if (Math.abs((flipped ? -w.off : w.off) - off) > WALL_OFFSET_TOL) continue;
+      parts = subtractInterval(parts, flipped ? [-w.t1, -w.t0] : [w.t0, w.t1]);
+      if (!parts.length) break;
+    }
+    floorWalls.push({ ang, off, t0, t1 });
+    for (const [a, b] of parts) {
+      addWallSegment(a * dx - off * dy, -(a * dy + off * dx), b * dx - off * dy, -(b * dy + off * dx));
+    }
+  };
+  const addRoomLowWalls = feature => {
+    for (const poly of ringsFromGeometry(feature.geometry)) {
+      // Outline cleaning works in the plan (x, north).
+      const ring = (poly[0] || []).map(pt => { const [x, z] = project(pt); return [x, -z]; });
+      const outline = cleanWallOutline(ring);
+      for (let i = 0; i < outline.length - 1; i++) addDedupedWall(outline[i][0], outline[i][1], outline[i + 1][0], outline[i + 1][1]);
+    }
+  };
+
+  const styleFor = (p, cls) => {
+    if (cls === 'classroom') {
+      // Each room keeps its own material pair, so a status change only recolours it.
+      const kind = roomStatus(occupancy, roomKey(p));
+      return { depth: .07, y: .10, mats: materialPair(...STATUS[kind], { fog }), kind };
+    }
+    if (cls === 'corridor') return { depth: .035, y: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide, { fog }) };
+    if (cls === 'vertical') return { depth: .12, y: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide, { fog }) };
+    if (cls === 'restroom') return { depth: .10, y: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide, { fog }) };
+    // Opaque: a semi-transparent space would let the faint neighbour floors bleed through the focused floor.
+    if (cls === 'service') return { depth: .065, y: .08, mats: materialPair(COLORS.service, COLORS.serviceSide, { fog }) };
+    return null;
+  };
+
+  const addFeatureLabels = (feature, cls) => {
+    const p = feature.properties;
+    if (cls === 'classroom' && p.classNumber) {
+      const c = centroidOfGeometry(feature.geometry, project);
+      const key = roomKey(p);
+      const label = { local: c.setY(LABEL_Y + 0), text: p.classNumber, kind: roomStatus(occupancy, key), key, role: 'room', floor: id, area: p.areaSquareMeters || 0 };
+      // GIS sometimes splits one room into several polygons (CB 4F 414): colour all of them, label once,
+      // on the largest piece.
+      const i = floor.labels.findIndex(l => l.key === key);
+      if (i < 0) floor.labels.push(label);
+      else if (label.area > floor.labels[i].area) floor.labels[i] = label;
+      return;
+    }
+    if (cls === 'vertical' || cls === 'restroom') {
+      const c = centroidOfGeometry(feature.geometry, project);
+      const name = (p.use || p.name || '');
+      const text = name.includes('電梯') ? '電梯' : name.includes('樓梯') ? '樓梯' : name.includes('廁') ? 'WC' : '';
+      if (text) floor.labels.push({ local: c.setY(.46 + 0), text, kind: 'poi', role: 'room', floor: id });
+    }
+  };
+
+  const addFeature = feature => {
+    const cls = classify(feature.properties);
+    if (cls === 'skip' || cls === 'void') return;
+    const style = styleFor(feature.properties, cls);
+    if (!style) return;
+    for (const rings of ringsFromGeometry(feature.geometry)) {
+      const shape = shapeFromRings(rings, project);
+      if (!shape) continue;
+      const geom = extrudeUp(shape, {
+        depth: style.depth,
+        bevelEnabled: false,
+        bevelSize: cls === 'classroom' ? .04 : .02,
+        bevelThickness: cls === 'classroom' ? .03 : .015,
+        bevelSegments: 1,
+        curveSegments: 2,
+      });
+      const mesh = new THREE.Mesh(geom, style.mats);
+      mesh.position.y = style.y + 0;
+      mesh.receiveShadow = receiveShadow;
+      mesh.userData = {
+        feature, cls, kind: style.kind, floorId: id, key: cls === 'classroom' ? roomKey(feature.properties) : null,
+        caster: cls === 'classroom' || cls === 'vertical' || cls === 'restroom',
+      };
+      group.add(mesh);
+      if (cls === 'classroom') {
+        floor.rooms.push(mesh);
+        const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 25), lineMat({ color: COLORS.outline, transparent: true, opacity: .24 }));
+        edge.position.y = style.y + 0 + .006;
+        group.add(edge);
+        addRoomLowWalls(feature);
+      } else if (cls === 'service' || cls === 'vertical' || cls === 'restroom') {
+        // Plan-style boundaries between the many neutral spaces; only drawn on the focused floor.
+        const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 25), lineMat({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }));
+        edge.position.y = style.y + 0 + .006;
+        edge.userData.focusStyle = 'space';
+        group.add(edge);
+      }
+    }
+    addFeatureLabels(feature, cls);
+  };
+
+  // Slab outline. The official building footprint is used when the floor fits inside it (A3T); some
+  // buildings' footprints do not match their floors (AM basements are much larger), so those floors fall
+  // back to the convex hull of their own spaces.
+  floor.hull = slabOutline(features, ctx.footprintM, classify, project);
+  floor.slab = addSlab(group, floor.hull, ctx.footprintFeature, project, COLORS, fog, receiveShadow, id);
+
+  const order = { corridor: 0, service: 1, vertical: 2, restroom: 3, classroom: 4, void: 8, skip: 9 };
+  features.slice().sort((a, b) => order[classify(a.properties)] - order[classify(b.properties)]).forEach(addFeature);
+
+  group.traverse(n => {
+    if (!n.isMesh && !n.isLineSegments) return;
+    floor.drawables.push(n);
+    if (n.userData.focusStyle === 'space') { floor.spaceEdges.push(n); return; }
+    if (n.isMesh) {
+      floor.hitMeshes.push(n);
+      if (n.userData.wall) floor.walls.push(n);
+      if (n.userData.caster) floor.casters.push(n);
+    }
+    // Always transparent so a floor can fade without a shader recompile.
+    for (const m of [].concat(n.material)) { m.transparent = true; floor.mats.push({ m, base: m.opacity }); }
+  });
+
+  // Outline-only ghost, kept outside the floor group so it can show while the fill is hidden.
+  const outlinePts = floor.slab?.userData.outlinePoints;
+  if (outlinePts?.length) {
+    const line = new THREE.LineLoop(
+      new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .08, -p.y))),
+      lineMat({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }),
+    );
+    line.renderOrder = 1;
+    line.visible = false;
+    floor.outline = line;
+    // Outer edge of the focused floor, above the room fills, below the walls.
+    const edge = new THREE.LineLoop(
+      new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .2, -p.y))),
+      lineMat({ color: COLORS.focusEdge, transparent: true, opacity: 0, depthWrite: false }),
+    );
+    edge.renderOrder = 3;
+    edge.visible = false;
+    group.add(edge);
+    floor.focusEdge = edge;
+  }
+  // Local bounds (walls at full height), computed once: layouts only offset them by the group's y.
+  group.position.y = 0;
+  floor.localBox = new THREE.Box3().setFromObject(group);
+  return floor;
+}
+
+function slabOutline(features, footprintM, classify, project) {
+  const fb = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity };
+  footprintM.forEach(([x, z]) => { fb.minX = Math.min(fb.minX, x); fb.maxX = Math.max(fb.maxX, x); fb.minZ = Math.min(fb.minZ, z); fb.maxZ = Math.max(fb.maxZ, z); });
+  const pts = features
+    .filter(f => !['skip', 'void'].includes(classify(f.properties)))
+    .flatMap(f => allCoords(f.geometry))
+    .map(p => project(p));
+  if (!pts.length) return null;
+  const tol = 2;
+  const inside = pts.every(([x, z]) => x >= fb.minX - tol && x <= fb.maxX + tol && z >= fb.minZ - tol && z <= fb.maxZ + tol);
+  // Hull taken in the plan (x, north) so its winding and start vertex match the slab shape's frame.
+  return inside ? null : convexHull(pts.map(([x, z]) => [x, -z])).map(([x, n]) => [x, -n]);
+}
+
+function addSlab(group, hull, footprintFeature, project, COLORS, fog, receiveShadow, floorId) {
+  let shape = null;
+  if (hull) shape = shapeFromPoints(hull);
+  else if (footprintFeature) {
+    for (const rings of ringsFromGeometry(footprintFeature.geometry)) {
+      const s = shapeFromRings(rings, project);
+      if (s) { shape = s; break; }
+    }
+  }
+  if (!shape) return null;
+  const depth = SLAB_DEPTH;
+  const geom = extrudeUp(shape, { depth, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 });
+  const mesh = new THREE.Mesh(geom, materialPair(COLORS.slabTop, COLORS.slabSide, { fog }));
+  mesh.position.y = .06 - depth;
+  mesh.receiveShadow = receiveShadow;
+  mesh.userData = { floorLayer: true, floorId, outlinePoints: shape.getPoints() };
+  group.add(mesh);
+  return mesh;
+}
