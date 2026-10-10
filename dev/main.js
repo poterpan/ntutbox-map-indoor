@@ -2,7 +2,7 @@
 // legend, period + building pickers, room sheet, campus card), computes occupancy from the course
 // timetable and pushes it into the engine through its public API only.
 import { createIndoorMap, campusCdnSource, campusModelSource } from '../src/index.js';
-import '../src/engine/indoor-map.css';
+import '../src/viewer/indoor-map.css';
 import { parsePeriods, pickTerm, resolveSlot, slotAt, buildOccupancy, summarizeBuildings } from './course-occupancy.js';
 import fixtureRooms from './fixtures/rooms-115-1.json';
 import fixturePeriods from './fixtures/periods-115-1.json';
@@ -195,7 +195,7 @@ const map = createIndoorMap(scene, {
 window.__map = map; // for manual poking in devtools
 // Resolves when the map looks idle: the engine has no public "flying" flag, so this waits for the map to be ready, then
 // for a quiet period with no onViewChange and an unchanged getView(), plus a fixed margin for the 650 ms flight tween and
-// opacity fades (src/engine/indoor-map.js FOCUS_LAYOUT.durationMs, applyFades). Pixel stability is re-checked by the capture script.
+// opacity fades (src/viewer/indoor-map.js FOCUS_LAYOUT.durationMs, the layer fades in src/layer/indoor-layer.js). Pixel stability is re-checked by the capture script.
 window.__settled = async ({ quietMs = 900, timeoutMs = 15000 } = {}) => {
   await map.ready;
   const t0 = performance.now();

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { floorRank } from '../src/engine/indoor-map.js';
+import { floorRank } from '../src/data/indoor.js';
 
 const sorted = ids => ids.slice().sort((a, b) => floorRank(a) - floorRank(b));
 

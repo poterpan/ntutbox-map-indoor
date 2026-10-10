@@ -22,7 +22,11 @@
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
     },
-    "./style.css": "./src/engine/indoor-map.css",
+    "./layer": {
+      "types": "./src/layer/index.d.ts",
+      "default": "./src/layer/index.js"
+    },
+    "./style.css": "./src/viewer/indoor-map.css",
     "./package.json": "./package.json"
   },
   "main": "./src/index.js",
@@ -33,7 +37,8 @@
   "files": [
     "src",
     "docs/DATA-FORMAT.md",
-    "docs/DESIGN.md"
+    "docs/DESIGN.md",
+    "docs/LAYER.md"
   ],
   "scripts": {
     "dev": "vite --host 0.0.0.0",

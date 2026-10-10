@@ -1,6 +1,8 @@
 // Type definitions for @ntutbox/map-indoor. The runtime is plain JavaScript (src/index.js); keep these in step
-// with createIndoorMap's options, callbacks and returned API.
+// with createIndoorMap's options, callbacks and returned API, and with createIndoorLayer / createLabelOverlay
+// (docs/LAYER.md). The layer and overlay types reference three.js types (install @types/three to use them).
 import type { FeatureCollection, MultiPolygon, Polygon } from './geojson.js';
+import type { Box3, Camera, Group, Object3D, Raycaster, Vector3 } from 'three';
 
 export type RoomStatus = 'free' | 'soon' | 'busy' | 'unknown';
 export const ROOM_STATUSES: readonly RoomStatus[];
@@ -174,3 +176,215 @@ export interface IndoorMap<O extends HasStatus = OccupancyRecord> {
 
 /** Must run in the browser; throws when WebGL is unavailable. The engine adds its own element inside `container`. */
 export function createIndoorMap<O extends HasStatus = OccupancyRecord>(container: HTMLElement, options?: IndoorMapOptions<O>): IndoorMap<O>;
+
+// ---------------------------------------------------------------------------------------------
+// IndoorLayer: the indoor floors in a host's own three.js scene (docs/LAYER.md).
+// World frame: Y-up metres, x = E − 302800, y = height, z = −(N − 2770400) (TWD97). Never transform layer.object.
+// ---------------------------------------------------------------------------------------------
+
+/** Indoor colours (hex). Status fills: free / soon / room (= busy) / unknown, each with a darker side colour. */
+export interface IndoorPalette {
+  slabTop: number; slabSide: number;
+  room: number; roomSide: number;
+  free: number; freeSide: number;
+  soon: number; soonSide: number;
+  unknown: number; unknownSide: number;
+  corridor: number; corridorSide: number;
+  vertical: number; verticalSide: number;
+  restroom: number; restroomSide: number;
+  service: number; serviceSide: number;
+  wall: number; wallSide: number;
+  /** Room edges, neighbour-floor outlines. */
+  outline: number;
+  /** Outer edge of the focused floor. */
+  focusEdge: number;
+  /** Selection / hover tint and selection outline. */
+  accent: number;
+}
+
+export type PresentationMode = 'inplace' | 'stack' | 'floor';
+
+export interface PresentationOptions {
+  /** Building to show (must be loaded), or null to hide (animated: it drops to its real heights and fades out). */
+  building: string | null;
+  /** 'inplace' every floor at its elevation; 'stack' exploded overview; 'floor' one floor. Default 'stack'. */
+  mode?: PresentationMode;
+  /** Required for mode 'floor'. */
+  floor?: string | null;
+  /** Stack: distance between overview floors (m). Default 3 × floorHeight. Changing it only re-lays out. */
+  stackGap?: number;
+  /** Stack: extra gap, as a fraction of stackGap, where floors without classrooms were skipped. Default .45. */
+  skipExtra?: number;
+  /** Floor: spacing per storey around the focused floor. Default floorHeight. */
+  floorGap?: number;
+  /** Floor: base height of the focused floor. Default max(elevation(floor), groundY). */
+  focusY?: number;
+  /** Ground direction [x, z] pointing to the screen's right; floor badges and skip markers line up on the
+   *  opposite (left) edge of the stack. Default: the previous value, else [1, 0] (east). */
+  screenRight?: [number, number];
+  animate?: boolean;
+  /** ms, default 650. */
+  duration?: number;
+  /** Default easeInOutCubic. */
+  easing?: (t: number) => number;
+}
+
+/** The current target presentation (where the layer is, or is going). */
+export interface Presentation {
+  readonly building: string | null;
+  readonly mode: PresentationMode;
+  readonly floor: string | null;
+  readonly stackGap: number;
+  readonly skipExtra: number;
+  readonly floorGap: number;
+  readonly focusY?: number;
+  readonly screenRight: [number, number] | null;
+}
+
+export interface PickResult {
+  /** 'room' a classroom; 'space' any other space or a wall (cls 'wall'); 'floor' a slab. */
+  kind: 'room' | 'space' | 'floor';
+  building: string;
+  floor: string;
+  /** "buildingId/floorId/classNumber" for rooms. */
+  key?: string;
+  /** Space class: classroom | corridor | vertical | restroom | service | wall. */
+  cls?: string;
+  point: Vector3;
+  distance: number;
+  object: Object3D;
+}
+
+export type IndoorLabelRole = 'room' | 'badge' | 'skip';
+
+/** Label data for an overlay. Objects are reused between calls; read them, do not keep them. */
+export interface IndoorLabel {
+  /** Stable across frames and presentation changes: room:KEY, poi:B/F/n, entrance:B, badge:B/F, skip:B/F1-F2. */
+  readonly id: string;
+  /** World position for the current frame. */
+  readonly position: Vector3;
+  readonly text: string;
+  /** 'room' (room numbers, facilities, entrance), 'badge' (floor summary in the stack), 'skip' (floors without classrooms). */
+  readonly role: IndoorLabelRole;
+  /** room: RoomStatus; facilities 'poi'; 'entrance'; badge 'open' | 'partial' | 'full'; 'skip'. */
+  readonly kind: string;
+  /** Collision order, higher first (entrance 3, rooms 2–2.5 by area, facilities 1). */
+  readonly priority: number;
+  /** 0..1 from the presentation (pixel-density declutter is the overlay's job). */
+  readonly opacity: number;
+  readonly key?: string;
+  readonly floor?: string;
+  /** Badges: that floor's stats. */
+  readonly stats?: FloorStats;
+}
+
+export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
+  source: CampusSource;
+  buildings?: Record<string, BuildingConfig>;
+  occupancy?: Occupancy<O> | null;
+  /** Storey height for elevation(); default 3.2. */
+  floorHeight?: number;
+  /** Height of 1F's floor; default 0. */
+  groundY?: number;
+  palette?: Partial<IndoorPalette>;
+  /** Materials react to scene fog; default false. */
+  fog?: boolean;
+  /** cast: the focused floor (mode 'floor') casts shadows; default false. receive: default true. */
+  shadows?: { cast?: boolean; receive?: boolean };
+  /** Added to every renderOrder the layer sets (1–3); default 0. */
+  renderOrderBase?: number;
+  /** lonlat sources only: projection reference; default the centre of campus "A". */
+  lonlatOrigin?: { lon: number; lat: number } | (() => { lon: number; lat: number });
+  /** 'floor-missing' when a floor file is absent. Load failures reject load() instead. */
+  onError?: (error: MapError) => void;
+}
+
+export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
+  /** Add this to your scene. One child group per loaded building. */
+  readonly object: Group;
+  /** Fetch and build a building (kept, hidden, until shown). Several can be loaded. Rejects on load failure. */
+  load(buildingId: string): Promise<void>;
+  unload(buildingId: string): void;
+  /** Fetch a building's floor data without building geometry. */
+  prefetch(buildingId: string): Promise<void>;
+  isLoaded(buildingId: string): boolean;
+  /** Resolves true when it lands, false when superseded by the next call (or disposed). Rejects for an unknown building / floor. */
+  setPresentation(p: PresentationOptions): Promise<boolean>;
+  readonly presentation: Presentation;
+  /** True while a presentation change is animating. */
+  readonly animating: boolean;
+  /** Advance animations by dt seconds. Returns true while anything still moves (keep rendering). */
+  update(dt: number): boolean;
+  pick(raycaster: Raycaster): PickResult | null;
+  /** Recolours rooms. Returns true when the set of rooms changed and the building was rebuilt (layout kept). */
+  setOccupancy(occupancy: Occupancy<O> | null): boolean;
+  /** Stack: keep this floor solid and fade the others. */
+  setHoveredFloor(floorId: string | null): void;
+  setHovered(key: string | null): void;
+  /** Selection visual: accent outline + slight tint. */
+  setSelected(key: string | null): void;
+  /** 0..1: emissive = colour × k, so status colours stay readable in a dark scene. */
+  setEmissive(k: number): void;
+  /** World boxes in the layout the presentation lands in (stack: the overview floors only). */
+  buildingBox(buildingId: string): Box3 | null;
+  floorBox(buildingId: string, floorId: string): Box3 | null;
+  roomBox(key: string): Box3 | null;
+  /** Bottom to top. */
+  floors(buildingId: string): FloorStats[];
+  /** (storey index − index of 1F) × floorHeight + groundY. */
+  elevation(buildingId: string, floorId: string): number | null;
+  /** Ground points [x, z] of what the stack shows (footprint + overview floor hulls), to derive a stack gap. */
+  outlinePoints(buildingId: string): [number, number][];
+  room(key: string): RoomInfo<O> | null;
+  /** Labels of the shown building for this frame. */
+  labels(): readonly IndoorLabel[];
+  dispose(): void;
+}
+
+/** No DOM, no renderer, no camera. */
+export function createIndoorLayer<O extends HasStatus = OccupancyRecord>(options: IndoorLayerOptions<O>): IndoorLayer<O>;
+
+// ---------------------------------------------------------------------------------------------
+// Label overlay: DOM labels for any camera (orthographic or perspective).
+// ---------------------------------------------------------------------------------------------
+
+export interface OverlayLabel {
+  id: string;
+  position: Vector3;
+  text: string;
+  /** 'room' and 'campus' labels avoid each other; 'badge' labels get click / hover callbacks. */
+  role: string;
+  kind?: string;
+  priority?: number;
+  opacity: number;
+  floor?: string;
+}
+
+export interface LabelOverlayOptions<L extends OverlayLabel = OverlayLabel> {
+  /** Base class of every label element; default 'label' (styled by the package stylesheet inside .indoor-map). */
+  className?: string;
+  /** Extra classes per label; default defaultLabelClass. Called every frame; cheap and pure. */
+  classFor?: (label: L) => string;
+  onBadgeClick?: (label: L) => void;
+  onBadgeHover?: (label: L | null) => void;
+  collision?: { gap: number; hysteresis: number };
+  /** kind 'poi' labels fade in between these screen densities (px per metre). Default 6 → 8.5. */
+  declutter?: { poiFrom: number; poiTo: number };
+  pixelsPerMetre?: (camera: Camera, world: Vector3, height: number) => number;
+}
+
+export interface LabelOverlay<L extends OverlayLabel = OverlayLabel> {
+  /** Every frame, after the camera moved: diff the elements, project, declutter, avoid collisions. */
+  update(camera: Camera, labels: readonly L[]): void;
+  /** Create / remove / restyle elements without positioning (e.g. before measuring). */
+  sync(labels: readonly L[]): void;
+  /** Widest label element matching filter, in px. */
+  maxWidth(filter?: (label: L) => boolean): number;
+  element(id: string): HTMLElement | null;
+  clear(): void;
+  dispose(): void;
+}
+
+/** Label elements are appended to `container`, which should be positioned and cover the canvas. */
+export function createLabelOverlay<L extends OverlayLabel = OverlayLabel>(container: HTMLElement, options?: LabelOverlayOptions<L>): LabelOverlay<L>;
+export function defaultLabelClass(label: OverlayLabel): string;
