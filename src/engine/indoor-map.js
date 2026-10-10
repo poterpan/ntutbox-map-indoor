@@ -137,9 +137,15 @@ compassEl.setAttribute('aria-label', '指北針，點一下轉回正門方向');
 compassEl.innerHTML = '<span class="dial"><i>▲</i><b>N</b></span>';
 root.appendChild(compassEl);
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0xaeb7c4, 2.15));
+// World frame (shared with the campus 3D map): Y-up metres, x = E − 302800, y = height, z = −(N − 2770400).
+// North is −Z. Planar-cm sources are already relative to that origin (see project()).
+const hemi = new THREE.HemisphereLight(0xffffff, 0xaeb7c4, 2.15);
+// The sky colour has always come from the north (the default +Y of the former Z-up frame); kept as-is so
+// the frame change is pixel-identical.
+hemi.position.set(0, 0, -1);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 2.6);
-sun.position.set(45, -35, 80);
+sun.position.set(45, 80, 35);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.left = -130;
@@ -148,6 +154,8 @@ sun.shadow.camera.top = 130;
 sun.shadow.camera.bottom = -130;
 sun.shadow.camera.near = 1;
 sun.shadow.camera.far = 300;
+// Shadow-map texel grid oriented north-up, as before the frame change.
+sun.shadow.camera.up.set(0, 0, -1);
 scene.add(sun);
 
 scene.add(sun.target);
@@ -233,10 +241,26 @@ function metersFromLonLat(lon, lat, originLon, originLat) {
   ];
 }
 
-// Source coordinates → local metres around `origin` (the world origin, in the source's own units).
-function project(pt, origin) {
-  if (FRAME === 'planar-cm') return [(pt[0] - origin.lon) / 100, (pt[1] - origin.lat) / 100];
-  return metersFromLonLat(pt[0], pt[1], origin.lon, origin.lat);
+// Source coordinates → ground position [x, z] in the world frame. planar-cm is integer cm relative to the
+// published origin (TWD97 302800, 2770400): x = east, z = −north. A lonlat source has no published origin;
+// it is projected to metres around a fixed reference (the campus centre, set once in start()).
+let LONLAT_REF = null;
+function project(pt) {
+  if (FRAME === 'planar-cm') return [pt[0] / 100, -pt[1] / 100];
+  const [e, n] = metersFromLonLat(pt[0], pt[1], LONLAT_REF.lon, LONLAT_REF.lat);
+  return [e, -n];
+}
+
+// Shapes are drawn in the plan (x, north) and extruded along +Z; extrudeUp turns that into the world frame
+// (extrusion along +Y, north to −Z).
+function shapeFromPoints(points, hole = false) {
+  const p = hole ? new THREE.Path() : new THREE.Shape();
+  points.forEach(([x, z], i) => (i ? p.lineTo(x, -z) : p.moveTo(x, -z)));
+  p.closePath();
+  return p;
+}
+function extrudeUp(shape, options) {
+  return new THREE.ExtrudeGeometry(shape, options).rotateX(-Math.PI / 2);
 }
 
 function ringsFromGeometry(geometry) {
@@ -245,30 +269,21 @@ function ringsFromGeometry(geometry) {
   return [];
 }
 
-function shapeFromRings(rings, origin) {
+function shapeFromRings(rings) {
   if (!rings?.length || rings[0].length < 3) return null;
-  const makePath = (coords, hole = false) => {
-    const p = hole ? new THREE.Path() : new THREE.Shape();
-    coords.forEach((pt, i) => {
-      const [x, y] = project(pt, origin);
-      if (i === 0) p.moveTo(x, y); else p.lineTo(x, y);
-    });
-    p.closePath();
-    return p;
-  };
-  const shape = makePath(rings[0]);
-  for (let i = 1; i < rings.length; i++) shape.holes.push(makePath(rings[i], true));
+  const shape = shapeFromPoints(rings[0].map(pt => project(pt)));
+  for (let i = 1; i < rings.length; i++) shape.holes.push(shapeFromPoints(rings[i].map(pt => project(pt)), true));
   return shape;
 }
 
-function centroidOfGeometry(geometry, origin) {
+function centroidOfGeometry(geometry) {
   const pts = allCoords(geometry);
-  let sx = 0, sy = 0;
+  let sx = 0, sz = 0;
   for (const p of pts) {
-    const [x, y] = project(p, origin);
-    sx += x; sy += y;
+    const [x, z] = project(p);
+    sx += x; sz += z;
   }
-  return new THREE.Vector3(sx / pts.length, sy / pts.length, 0);
+  return new THREE.Vector3(sx / pts.length, 0, sz / pts.length);
 }
 
 function clearGroup(group) {
@@ -314,17 +329,18 @@ function materialPair(top, side, transparent = false, opacity = 1) {
 
 // Low walls: tall enough to read as rooms at the single-floor tilt, low enough not to hide the floor colour.
 const WALL = { base: .18, height: .85, thickness: .14 };
-const LABEL_Z = WALL.base + WALL.height + .2;
+const LABEL_Y = WALL.base + WALL.height + .2;
 
-function addWallSegment(group, x1, y1, x2, y2, zBase = WALL.base, height = WALL.height, thickness = WALL.thickness) {
-  const dx = x2 - x1, dy = y2 - y1;
-  const len = Math.hypot(dx, dy);
+// Wall from ground point (x1, z1) to (x2, z2).
+function addWallSegment(group, x1, z1, x2, z2, yBase = WALL.base, height = WALL.height, thickness = WALL.thickness) {
+  const dx = x2 - x1, dz = z2 - z1;
+  const len = Math.hypot(dx, dz);
   if (len < .08) return;
-  const geom = new THREE.BoxGeometry(len, thickness, height);
+  const geom = new THREE.BoxGeometry(len, height, thickness);
   const mat = new THREE.MeshStandardMaterial({ color: COLORS.wallSide, roughness: .95, metalness: 0 });
   const mesh = new THREE.Mesh(geom, mat);
-  mesh.position.set((x1+x2)/2, (y1+y2)/2, zBase + height/2);
-  mesh.rotation.z = Math.atan2(dy, dx);
+  mesh.position.set((x1+x2)/2, yBase + height/2, (z1+z2)/2);
+  mesh.rotation.y = -Math.atan2(dz, dx);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   group.add(mesh);
@@ -342,8 +358,9 @@ function subtractInterval(parts, [c0, c1]) {
   });
 }
 
+// Plan coordinates (x, north) in; walls are placed at world (x, −north).
 function addDedupedWall(group, ax, ay, bx, by) {
-  if (!floorWalls) { addWallSegment(group, ax, ay, bx, by); return; }
+  if (!floorWalls) { addWallSegment(group, ax, -ay, bx, -by); return; }
   let ang = Math.atan2(by - ay, bx - ax);
   if (ang < 0) ang += Math.PI;
   if (ang >= Math.PI) ang -= Math.PI;
@@ -363,7 +380,7 @@ function addDedupedWall(group, ax, ay, bx, by) {
   }
   floorWalls.push({ ang, off, t0, t1 });
   for (const [a, b] of parts) {
-    addWallSegment(group, a * dx - off * dy, a * dy + off * dx, b * dx - off * dy, b * dy + off * dx);
+    addWallSegment(group, a * dx - off * dy, -(a * dy + off * dx), b * dx - off * dy, -(b * dy + off * dx));
   }
 }
 
@@ -419,9 +436,10 @@ function cleanWallOutline(ring) {
   return out;
 }
 
-function addRoomLowWalls(feature, origin, group) {
+function addRoomLowWalls(feature, group) {
   for (const poly of ringsFromGeometry(feature.geometry)) {
-    const ring = (poly[0] || []).map(pt => project(pt, origin));
+    // Outline cleaning works in the plan (x, north), so wall dedupe sees the same geometry as before.
+    const ring = (poly[0] || []).map(pt => { const [x, z] = project(pt); return [x, -z]; });
     const outline = cleanWallOutline(ring);
     for (let i = 0; i < outline.length - 1; i++) {
       addDedupedWall(group, outline[i][0], outline[i][1], outline[i+1][0], outline[i+1][1]);
@@ -443,26 +461,26 @@ function styleForFeature(feature, floorId = currentFloor, lowWall = true) {
   if (cls === 'classroom') {
     // Each room keeps its own material pair, so a status change only recolours it (see restyleRooms).
     const kind = roomStatus(roomKey(p));
-    return { depth: lowWall ? .07 : .22, z: .10, mats: materialPair(...STATUS_COLORS[kind]), kind };
+    return { depth: lowWall ? .07 : .22, y: .10, mats: materialPair(...STATUS_COLORS[kind]), kind };
   }
-  if (cls === 'corridor') return { depth: .035, z: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide) };
-  if (cls === 'vertical') return { depth: .12, z: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide) };
-  if (cls === 'restroom') return { depth: .10, z: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide) };
+  if (cls === 'corridor') return { depth: .035, y: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide) };
+  if (cls === 'vertical') return { depth: .12, y: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide) };
+  if (cls === 'restroom') return { depth: .10, y: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide) };
   // Opaque: a semi-transparent space would let the faint neighbour floors bleed through the focused floor.
-  if (cls === 'service') return { depth: .065, z: .08, mats: materialPair(COLORS.service, COLORS.serviceSide) };
+  if (cls === 'service') return { depth: .065, y: .08, mats: materialPair(COLORS.service, COLORS.serviceSide) };
   return null;
 }
 
-function addExtrudedFeature(feature, origin, group, { floorId = currentFloor, lowWall = true, zOffset = 0, interactive = true, includeLabels = true, targets = clickTargets, labelSink = labels, labelZ = zOffset } = {}) {
+function addExtrudedFeature(feature, group, { floorId = currentFloor, lowWall = true, yOffset = 0, interactive = true, includeLabels = true, targets = clickTargets, labelSink = labels, labelY = yOffset } = {}) {
   const cls = classifyFeature(feature.properties);
   if (cls === 'skip' || cls === 'void') return;
   const style = styleForFeature(feature, floorId, lowWall);
   if (!style) return;
 
   for (const rings of ringsFromGeometry(feature.geometry)) {
-    const shape = shapeFromRings(rings, origin);
+    const shape = shapeFromRings(rings);
     if (!shape) continue;
-    const geom = new THREE.ExtrudeGeometry(shape, {
+    const geom = extrudeUp(shape, {
       depth: style.depth,
       bevelEnabled: cls !== 'corridor' && !lowWall,
       bevelSize: cls === 'classroom' ? .04 : .02,
@@ -471,7 +489,7 @@ function addExtrudedFeature(feature, origin, group, { floorId = currentFloor, lo
       curveSegments: 2,
     });
     const mesh = new THREE.Mesh(geom, style.mats);
-    mesh.position.z = style.z + zOffset;
+    mesh.position.y = style.y + yOffset;
     mesh.castShadow = cls === 'classroom' || cls === 'vertical' || cls === 'restroom';
     mesh.receiveShadow = true;
     mesh.userData = { feature, cls, kind: style.kind, floorId, key: cls === 'classroom' ? roomKey(feature.properties) : null };
@@ -483,41 +501,41 @@ function addExtrudedFeature(feature, origin, group, { floorId = currentFloor, lo
         new THREE.EdgesGeometry(geom, 25),
         new THREE.LineBasicMaterial({ color: COLORS.outline, transparent: true, opacity: .24 })
       );
-      edge.position.z = style.z + zOffset + .006;
+      edge.position.y = style.y + yOffset + .006;
       group.add(edge);
-      if (lowWall) addRoomLowWalls(feature, origin, groupWithOffset(group, zOffset));
+      if (lowWall) addRoomLowWalls(feature, groupWithOffset(group, yOffset));
     } else if (cls === 'service' || cls === 'vertical' || cls === 'restroom') {
       // Plan-style boundaries between the many neutral spaces; only drawn on the focused floor.
       const edge = new THREE.LineSegments(
         new THREE.EdgesGeometry(geom, 25),
         new THREE.LineBasicMaterial({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false })
       );
-      edge.position.z = style.z + zOffset + .006;
+      edge.position.y = style.y + yOffset + .006;
       edge.userData.focusStyle = 'space';
       group.add(edge);
     }
   }
 
-  if (includeLabels) addFeatureLabels(feature, origin, floorId, labelZ, labelSink);
+  if (includeLabels) addFeatureLabels(feature, floorId, labelY, labelSink);
 }
 
 // Lightweight wrapper that makes wall helpers place meshes at the current floor offset.
-function groupWithOffset(group, zOffset) {
+function groupWithOffset(group, yOffset) {
   return {
     add(mesh) {
-      mesh.position.z += zOffset;
+      mesh.position.y += yOffset;
       group.add(mesh);
     }
   };
 }
 
-function addFeatureLabels(feature, origin, floorId, zOffset, sink) {
+function addFeatureLabels(feature, floorId, yOffset, sink) {
   const p = feature.properties;
   const cls = classifyFeature(p);
   if (cls === 'classroom' && p.classNumber) {
-    const c = centroidOfGeometry(feature.geometry, origin);
+    const c = centroidOfGeometry(feature.geometry);
     const key = roomKey(p);
-    const label = { local: c.setZ(LABEL_Z + zOffset), text: p.classNumber, kind: LABEL_KIND[roomStatus(key)], key, role: 'room', floor: floorId, area: p.areaSquareMeters || 0 };
+    const label = { local: c.setY(LABEL_Y + yOffset), text: p.classNumber, kind: LABEL_KIND[roomStatus(key)], key, role: 'room', floor: floorId, area: p.areaSquareMeters || 0 };
     // GIS sometimes splits one room into several polygons (CB 4F 414): colour all of them, label once,
     // on the largest piece.
     const i = sink.findIndex(l => l.key === key);
@@ -526,10 +544,10 @@ function addFeatureLabels(feature, origin, floorId, zOffset, sink) {
     return;
   }
   if (cls === 'vertical' || cls === 'restroom') {
-    const c = centroidOfGeometry(feature.geometry, origin);
+    const c = centroidOfGeometry(feature.geometry);
     const name = (p.use || p.name || '');
     let text = name.includes('電梯') ? '電梯' : name.includes('樓梯') ? '樓梯' : name.includes('廁') ? 'WC' : '';
-    if (text) sink.push({ local: c.setZ(.46 + zOffset), text, kind: 'poi', role: 'room', floor: floorId });
+    if (text) sink.push({ local: c.setY(.46 + yOffset), text, kind: 'poi', role: 'room', floor: floorId });
   }
 }
 
@@ -682,7 +700,7 @@ const CAMPUS_NAV = {
 
 const floorDataCache = {};
 let floorDatas = {};
-let floors = new Map(); // floorId -> { id, index, overviewZ, focusZ, group, slab, stats, rooms, hitMeshes, drawables, walls, labels, badge, mats, casters, fade, fadeTarget }
+let floors = new Map(); // floorId -> { id, index, overviewY, focusY, group, slab, stats, rooms, hitMeshes, drawables, walls, labels, badge, mats, casters, fade, fadeTarget }
 let skipMarkers = [];
 let focusFloor = null;
 let hoverFloor = null;
@@ -690,8 +708,8 @@ let builtPortrait = null;
 let overviewHeading = 0; // per building, set by layoutFloors
 let modeBlend = 0; // 0 = overview, 1 = single floor; tweened together with the camera
 let campusBlend = 0; // 1 = campus white model, 0 = inside a building; tweened with the camera
-// Shared world origin for the campus model and every building, so the camera can fly between them.
-let WORLD_ORIGIN = null;
+// Lon/lat bounds of the campus white model, in the source's own units (ground plane extent).
+let campusBounds = null;
 let campusMats = []; // { m, base, kind: 'selected' | 'other' | 'ground', mesh }
 let campusBuildings = new Map(); // indoor buildingId -> { meshes, box, label, modelMats }
 let campusFocus = null; // { id, via: 'tap' | 'zoom' | 'return' } – highlighted building with its card
@@ -742,37 +760,36 @@ function convexHull(points) {
 // Floor slab outline. The official building footprint is used when the floor fits inside it (A3T);
 // some buildings' footprints do not match their floors (AM basements are much larger), so those floors
 // fall back to the convex hull of their own spaces.
-function slabOutline(data, origin, footprintM) {
-  const fb = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
-  footprintM.forEach(([x, y]) => { fb.minX = Math.min(fb.minX, x); fb.maxX = Math.max(fb.maxX, x); fb.minY = Math.min(fb.minY, y); fb.maxY = Math.max(fb.maxY, y); });
+// Points are ground [x, z]; the hull is returned as ground [x, z] too.
+function slabOutline(data, footprintM) {
+  const fb = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity };
+  footprintM.forEach(([x, z]) => { fb.minX = Math.min(fb.minX, x); fb.maxX = Math.max(fb.maxX, x); fb.minZ = Math.min(fb.minZ, z); fb.maxZ = Math.max(fb.maxZ, z); });
   const pts = data.features
     .filter(f => !['skip', 'void'].includes(classifyFeature(f.properties)))
     .flatMap(f => allCoords(f.geometry))
-    .map(p => project(p, origin));
+    .map(p => project(p));
   if (!pts.length) return null;
   const tol = 2;
-  const inside = pts.every(([x, y]) => x >= fb.minX - tol && x <= fb.maxX + tol && y >= fb.minY - tol && y <= fb.maxY + tol);
-  return inside ? null : convexHull(pts);
+  const inside = pts.every(([x, z]) => x >= fb.minX - tol && x <= fb.maxX + tol && z >= fb.minZ - tol && z <= fb.maxZ + tol);
+  // Hull taken in the plan (x, north) so its winding and start vertex match the slab shape's frame.
+  return inside ? null : convexHull(pts.map(([x, z]) => [x, -z])).map(([x, n]) => [x, -n]);
 }
 
-function addSlab(origin, group, depth, floorId, hull) {
+function addSlab(group, depth, floorId, hull) {
   const shapes = [];
   if (hull) {
-    const s = new THREE.Shape();
-    hull.forEach(([x, y], i) => (i ? s.lineTo(x, y) : s.moveTo(x, y)));
-    s.closePath();
-    shapes.push(s);
+    shapes.push(shapeFromPoints(hull));
   } else if (buildingFeature) {
     for (const rings of ringsFromGeometry(buildingFeature.geometry)) {
-      const s = shapeFromRings(rings, origin);
+      const s = shapeFromRings(rings);
       if (s) { shapes.push(s); break; }
     }
   }
   const shape = shapes[0];
   if (!shape) return null;
-  const geom = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 });
+  const geom = extrudeUp(shape, { depth, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 });
   const mesh = new THREE.Mesh(geom, materialPair(COLORS.slabTop, COLORS.slabSide));
-  mesh.position.z = .06 - depth;
+  mesh.position.y = .06 - depth;
   mesh.receiveShadow = true;
   mesh.userData = { floorLayer: true, floorId, outlinePoints: shape.getPoints() };
   group.add(mesh);
@@ -793,8 +810,7 @@ function buildBuilding() {
   clearGroup(buildingGroup);
   floors = new Map();
   skipMarkers = [];
-  const origin = WORLD_ORIGIN;
-  const footprintM = buildingFeature ? allCoords(buildingFeature.geometry).map(p => project(p, origin)) : [];
+  const footprintM = buildingFeature ? allCoords(buildingFeature.geometry).map(p => project(p)) : [];
 
   const order = { corridor: 0, service: 1, vertical: 2, restroom: 3, classroom: 4, void: 8, skip: 9 };
   STACK_ORDER.forEach((id, index) => {
@@ -803,20 +819,20 @@ function buildBuilding() {
     group.userData.floorId = id;
     buildingGroup.add(group);
     const floor = {
-      id, index, group, stats: statsForFloor(data, id), overviewZ: 0, focusZ: 0,
+      id, index, group, stats: statsForFloor(data, id), overviewY: 0, focusY: 0,
       rooms: [], hitMeshes: [], drawables: [], walls: [], wallScale: null, labels: [], mats: [], casters: [], fade: 0, fadeTarget: 0,
       outline: null, outlineFade: 0, outlineTarget: 0,
     };
-    floor.hull = slabOutline(data, origin, footprintM);
-    floor.slab = addSlab(origin, group, STACK_LAYOUT.slabDepth, id, floor.hull);
+    floor.hull = slabOutline(data, footprintM);
+    floor.slab = addSlab(group, STACK_LAYOUT.slabDepth, id, floor.hull);
 
     floorWalls = [];
     data.features
       .slice()
       .sort((a, b) => order[classifyFeature(a.properties)] - order[classifyFeature(b.properties)])
-      .forEach(f => addExtrudedFeature(f, origin, group, {
+      .forEach(f => addExtrudedFeature(f, group, {
         floorId: id, lowWall: true, interactive: true, includeLabels: true,
-        targets: floor.rooms, labelSink: floor.labels, labelZ: 0,
+        targets: floor.rooms, labelSink: floor.labels, labelY: 0,
       }));
     floorWalls = null;
 
@@ -837,7 +853,7 @@ function buildBuilding() {
     const outlinePts = floor.slab?.userData.outlinePoints;
     if (outlinePts?.length) {
       const line = new THREE.LineLoop(
-        new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, p.y, .08))),
+        new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .08, -p.y))),
         new THREE.LineBasicMaterial({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false })
       );
       line.renderOrder = 1;
@@ -846,7 +862,7 @@ function buildBuilding() {
       floor.outline = line;
       // Outer edge of the focused floor, above the room fills, below the walls.
       const edge = new THREE.LineLoop(
-        new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, p.y, .2))),
+        new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .2, -p.y))),
         new THREE.LineBasicMaterial({ color: COLORS.focusEdge, transparent: true, opacity: 0, depthWrite: false })
       );
       edge.renderOrder = 3;
@@ -857,12 +873,12 @@ function buildBuilding() {
     floors.set(id, floor);
   });
 
-  // Local bounds per floor, computed once: per-frame code only offsets them by the group's z.
+  // Local bounds per floor, computed once: per-frame code only offsets them by the group's y.
   for (const f of floors.values()) {
-    f.group.position.z = 0;
+    f.group.position.y = 0;
     f.localBox = new THREE.Box3().setFromObject(f.group);
   }
-  layoutFloors(origin, footprintM);
+  layoutFloors(footprintM);
   addEntranceMarker(footprintM);
   rebuildLabels();
   setFadeTargets();
@@ -871,26 +887,27 @@ function buildBuilding() {
 }
 
 // Vertical layout for both modes, plus badge / skip-marker anchors.
-function layoutFloors(origin, footprintM) {
+function layoutFloors(footprintM) {
   builtPortrait = isPortraitStage();
   const overviewIds = overviewFloorIds();
   // Extent of everything that is shown in the overview (footprint + hull floors).
   const pts = [...footprintM, ...overviewIds.flatMap(id => floors.get(id).hull || [])];
   // Entrance at the bottom (plan A), plus the overview's slight oblique offset.
   const heading = overviewHeading = entranceHeading() + VIEW_PRESETS.stacked.heading;
-  const up = [-Math.sin(heading), Math.cos(heading)], right = [Math.cos(heading), Math.sin(heading)];
+  // Ground [x, z] directions of screen-up and screen-right (north is −z).
+  const up = [-Math.sin(heading), -Math.cos(heading)], right = [Math.cos(heading), -Math.sin(heading)];
   const us = pts.map(p => p[0] * up[0] + p[1] * up[1]), rs = pts.map(p => p[0] * right[0] + p[1] * right[1]);
   const uMin = Math.min(...us), uMax = Math.max(...us);
   const gap = (uMax - uMin) / Math.tan(overviewTilt(builtPortrait)) * STACK_LAYOUT.gapRatio;
   const rBadge = Math.min(...rs) - 1.2, uMid = (uMin + uMax) / 2;
-  const badgeXY = new THREE.Vector3(right[0] * rBadge + up[0] * uMid, right[1] * rBadge + up[1] * uMid, 0);
+  const badgeXZ = new THREE.Vector3(right[0] * rBadge + up[0] * uMid, 0, right[1] * rBadge + up[1] * uMid);
 
   // Single floor: even spacing, anchored so the lowest overview floor stays put.
   const base = overviewIds.length ? floors.get(overviewIds[0]).index : 0;
-  for (const f of floors.values()) f.focusZ = (f.index - base) * gap;
+  for (const f of floors.values()) f.focusY = (f.index - base) * gap;
   // Campus: real storey heights, 1F on the ground, so the floors fill the white block they replace.
   const ground = STACK_ORDER.indexOf('1F') >= 0 ? STACK_ORDER.indexOf('1F') : base;
-  for (const f of floors.values()) f.campusZ = (f.index - ground) * CAMPUS_FLOOR_HEIGHT;
+  for (const f of floors.values()) f.campusY = (f.index - ground) * CAMPUS_FLOOR_HEIGHT;
 
   // Overview: consecutive slots, with extra room where floors without classrooms were skipped.
   let slot = 0, prev = null;
@@ -901,13 +918,13 @@ function layoutFloors(origin, footprintM) {
       const step = 1 + (skipped.length ? STACK_LAYOUT.skipExtra : 0);
       if (skipped.length) {
         skipMarkers.push({
-          local: badgeXY.clone(), between: [prev.id, id],
+          local: badgeXZ.clone(), between: [prev.id, id],
           text: `${floorRunLabel(skipped)} 沒有教室`, kind: 'floor-skip', role: 'skip',
         });
       }
       slot += step;
     }
-    f.overviewZ = slot * gap;
+    f.overviewY = slot * gap;
     prev = f;
   }
   // Floors that are hidden in the overview sit squeezed next to their nearest shown floor, so they
@@ -918,13 +935,13 @@ function layoutFloors(origin, footprintM) {
     if (!shown.length || shown.includes(f)) continue;
     const below = [...shown].reverse().find(s => s.index < f.index);
     const above = shown.find(s => s.index > f.index);
-    if (below && above) f.overviewZ = below.overviewZ + (above.overviewZ - below.overviewZ) * (f.index - below.index) / (above.index - below.index);
-    else if (below) f.overviewZ = below.overviewZ + (f.index - below.index) * gap * .08;
-    else f.overviewZ = above.overviewZ - (above.index - f.index) * gap * .08;
+    if (below && above) f.overviewY = below.overviewY + (above.overviewY - below.overviewY) * (f.index - below.index) / (above.index - below.index);
+    else if (below) f.overviewY = below.overviewY + (f.index - below.index) * gap * .08;
+    else f.overviewY = above.overviewY - (above.index - f.index) * gap * .08;
   }
   for (const f of floors.values()) {
     f.badge = {
-      local: badgeXY.clone(), text: badgeText(f),
+      local: badgeXZ.clone(), text: badgeText(f),
       kind: badgeKind(f.stats), role: 'badge', floor: f.id,
     };
   }
@@ -935,19 +952,19 @@ function addEntranceMarker(footprintM) {
   const ground = floors.get('1F');
   if (!ground || !footprintM.length) return;
   const b = (B().entranceBearing || 0) * Math.PI / 180;
-  const v = [Math.sin(b), Math.cos(b)];
-  const xs = footprintM.map(p => p[0]), ys = footprintM.map(p => p[1]);
-  const c = [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+  const v = [Math.sin(b), -Math.cos(b)]; // ground [x, z] towards the entrance
+  const xs = footprintM.map(p => p[0]), zs = footprintM.map(p => p[1]);
+  const c = [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...zs) + Math.max(...zs)) / 2];
   const reach = Math.max(...footprintM.map(p => (p[0] - c[0]) * v[0] + (p[1] - c[1]) * v[1]));
   ground.labels.push({
-    local: new THREE.Vector3(c[0] + v[0] * (reach + 2), c[1] + v[1] * (reach + 2), .5),
+    local: new THREE.Vector3(c[0] + v[0] * (reach + 2), .5, c[1] + v[1] * (reach + 2)),
     text: '正門', kind: 'entrance', role: 'room', floor: '1F',
   });
 }
 
-function floorZ(f) {
-  const inside = f.overviewZ + (f.focusZ - f.overviewZ) * modeBlend;
-  return inside + ((f.campusZ ?? inside) - inside) * campusBlend;
+function floorY(f) {
+  const inside = f.overviewY + (f.focusY - f.overviewY) * modeBlend;
+  return inside + ((f.campusY ?? inside) - inside) * campusBlend;
 }
 
 // Floors appear early in a flight from the campus (as the white block dissolves) and vanish late on the
@@ -958,8 +975,8 @@ function floorVisibility() {
 
 function updateFloorPositions() {
   for (const f of floors.values()) {
-    f.group.position.z = floorZ(f);
-    if (f.outline) f.outline.position.z = f.group.position.z;
+    f.group.position.y = floorY(f);
+    if (f.outline) f.outline.position.y = f.group.position.y;
   }
 }
 
@@ -1037,7 +1054,7 @@ function updateWallHeights() {
     const k = OVERVIEW_WALL_SCALE + (1 - OVERVIEW_WALL_SCALE) * grow;
     if (f.wallScale !== null && Math.abs(k - f.wallScale) < 1e-3) continue;
     f.wallScale = k;
-    for (const w of f.walls) { w.scale.z = k; w.position.z = WALL.base + WALL.height * k / 2; }
+    for (const w of f.walls) { w.scale.y = k; w.position.y = WALL.base + WALL.height * k / 2; }
   }
 }
 
@@ -1063,8 +1080,8 @@ function updateClickTargets() {
 
 // Bounding box of a floor as it will be once the layout for `mode` is reached (or right now).
 function floorBoxAt(f, mode) {
-  const z = mode === 'floor3d' ? f.focusZ : mode === 'campus' ? f.campusZ : mode === 'stacked' ? f.overviewZ : f.group.position.z;
-  return f.localBox.clone().translate(new THREE.Vector3(0, 0, z));
+  const y = mode === 'floor3d' ? f.focusY : mode === 'campus' ? f.campusY : mode === 'stacked' ? f.overviewY : f.group.position.y;
+  return f.localBox.clone().translate(new THREE.Vector3(0, y, 0));
 }
 
 function overviewBox() {
@@ -1078,9 +1095,10 @@ function badgeWidth() {
 }
 
 // Keep the shadow-casting light (and its shadow frustum) centred on what is being looked at.
-function aimSun(center, z = 0) {
-  sun.target.position.set(center.x, center.y, z);
-  sun.position.set(center.x + 45, center.y - 35, z + 80);
+// `y`: height of the shadow focus. The light comes from the south-east, high up.
+function aimSun(center, y = 0) {
+  sun.target.position.set(center.x, y, center.z);
+  sun.position.set(center.x + 45, y + 80, center.z + 35);
 }
 
 function showOverview({ animate = true } = {}) {
@@ -1106,7 +1124,7 @@ function showFloor(floorId, { animate = true } = {}) {
   endGesture(true);
   hideRoomSheet();
   const box = floorBoxAt(floor, 'floor3d');
-  aimSun(box.getCenter(new THREE.Vector3()), floor.focusZ);
+  aimSun(box.getCenter(new THREE.Vector3()), floor.focusY);
   setFadeTargets();
   updateClickTargets();
   updateChrome();
@@ -1217,16 +1235,16 @@ function estimateBuildingHeight(id) {
   return Math.max(6, (above.length ? Math.max(...above) : 2) * 3.2);
 }
 
-function createCampusBuilding(feature, origin) {
+function createCampusBuilding(feature) {
   const id = feature.properties.buildingId;
   const selected = id === buildingId; // dissolves into its floors during a flight
   const hasIndoor = !!BUILDINGS[id];
   const entry = hasIndoor ? { meshes: [], box: new THREE.Box3(), label: null } : null;
   const h = estimateBuildingHeight(id);
   for (const rings of ringsFromGeometry(feature.geometry)) {
-    const shape = shapeFromRings(rings, origin);
+    const shape = shapeFromRings(rings);
     if (!shape) continue;
-    const geom = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: true, bevelSize: .08, bevelThickness: .08, bevelSegments: 1 });
+    const geom = extrudeUp(shape, { depth: h, bevelEnabled: true, bevelSize: .08, bevelThickness: .08, bevelSegments: 1 });
     const mats = materialPair(COLORS.campus, COLORS.campusSide);
     const mesh = new THREE.Mesh(geom, mats);
     mesh.castShadow = true; mesh.receiveShadow = true;
@@ -1236,9 +1254,9 @@ function createCampusBuilding(feature, origin) {
     for (const m of mats) { m.transparent = true; campusMats.push({ m, base: 1, kind: selected ? 'selected' : 'other', mesh }); }
   }
   if (hasIndoor) {
-    const c = centroidOfGeometry(feature.geometry, origin);
+    const c = centroidOfGeometry(feature.geometry);
     const area = Number(feature.properties.buildingAreaSquareMeters) || 0;
-    entry.label = { local: c.setZ(h + 1.1), text: BUILDINGS[id].short || BUILDINGS[id].name, kind: 'building', role: 'campus', building: id, area };
+    entry.label = { local: c.setY(h + 1.1), text: BUILDINGS[id].short || BUILDINGS[id].name, kind: 'building', role: 'campus', building: id, area };
     campusLabels.push(entry.label);
     campusBuildings.set(id, entry);
   }
@@ -1257,9 +1275,10 @@ function campusFeatures() {
   const a = buildingsData.features.filter(f => f.properties.campusId === 'A');
   const cs = a.map(centroid);
   const c = [cs.reduce((s, p) => s + p[0], 0) / cs.length, cs.reduce((s, p) => s + p[1], 0) / cs.length];
+  const [cx, cz] = project(c);
   const near = f => {
-    const [x, y] = project(centroid(f), { lon: c[0], lat: c[1] });
-    return Math.hypot(x, y) <= opts.campusRadiusM;
+    const [x, z] = project(centroid(f));
+    return Math.hypot(x - cx, z - cz) <= opts.campusRadiusM;
   };
   return (campusFeatureCache = buildingsData.features.filter(f => f.properties.campusId === 'A' || (BUILDINGS[f.properties.buildingId] && near(f))));
 }
@@ -1270,14 +1289,13 @@ function campusClickTargets() {
 
 function buildCampus() {
   const main = campusFeatures();
-  const origin = WORLD_ORIGIN;
-  main.forEach(f => createCampusBuilding(f, origin));
-  const [minX, minY] = project([origin.minLon, origin.minLat], origin);
-  const [maxX, maxY] = project([origin.maxLon, origin.maxLat], origin);
+  main.forEach(f => createCampusBuilding(f));
+  const [x0, z0] = project([campusBounds.minLon, campusBounds.minLat]);
+  const [x1, z1] = project([campusBounds.maxLon, campusBounds.maxLat]);
   const groundMat = new THREE.MeshStandardMaterial({ color: COLORS.ground, roughness: 1, transparent: true });
   campusMats.push({ m: groundMat, base: 1, kind: 'ground' });
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry((maxX - minX) + 35, (maxY - minY) + 35), groundMat);
-  ground.position.set((minX + maxX) / 2, (minY + maxY) / 2, -.08);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(Math.abs(x1 - x0) + 35, Math.abs(z1 - z0) + 35).rotateX(-Math.PI / 2), groundMat);
+  ground.position.set((x0 + x1) / 2, -.08, (z0 + z1) / 2);
   ground.receiveShadow = true;
   campusGroup.add(ground);
   campusBuilt = true;
@@ -1329,8 +1347,9 @@ async function attachModels(gen) {
   // Nearest the campus centre first: the middle of the view fills in before the edges.
   const ids = [...new Set(campusFeatures().map(f => f.properties.buildingId))].filter(id => manifest.buildings[id]);
   const dist = id => {
-    const [x, y] = modelPosition(manifest.buildings[id].centroidEN);
-    return Math.hypot(x, y) - (id === campusFocus?.id ? 1e6 : 0);
+    const [x, z] = modelPosition(manifest.buildings[id].centroidEN);
+    const [cx, cz] = campusCenter();
+    return Math.hypot(x - cx, z - cz) - (id === campusFocus?.id ? 1e6 : 0);
   };
   ids.sort((a, b) => dist(a) - dist(b));
   let loaded = 0;
@@ -1354,18 +1373,21 @@ async function attachModels(gen) {
   emit('onModelsLoaded', { loaded, failed });
 }
 
-// EPSG:3826 metres → world metres, through the same projection as every footprint.
+// EPSG:3826 metres → world [x, z], through the same projection as every footprint.
 function modelPosition([e, n]) {
-  return project([(e - frameInfo.origin[0]) * 100, (n - frameInfo.origin[1]) * 100], WORLD_ORIGIN);
+  return project([(e - frameInfo.origin[0]) * 100, (n - frameInfo.origin[1]) * 100]);
+}
+// Ground [x, z] of the campus white model's centre.
+function campusCenter() {
+  return project([(campusBounds.minLon + campusBounds.maxLon) / 2, (campusBounds.minLat + campusBounds.maxLat) / 2]);
 }
 
 function placeModel(id, template, entry) {
-  const model = template.clone(true);
-  model.rotation.x = Math.PI / 2; // glTF is Y-up (x east, y up, z south); the engine is Z-up (x east, y north)
+  const model = template.clone(true); // glTF is Y-up (x east, y up, z south), the same frame as the world
   const wrap = new THREE.Group();
   wrap.add(model);
-  const [x, y] = modelPosition(entry.centroidEN);
-  wrap.position.set(x, y, 0);
+  const [x, z] = modelPosition(entry.centroidEN);
+  wrap.position.set(x, 0, z);
   wrap.userData = { model: id };
   const kind = id === buildingId ? 'selected' : 'other';
   const own = new Map(); // shared glTF material -> this building's copy (fades and highlights per building)
@@ -1388,18 +1410,18 @@ function placeModel(id, template, entry) {
   campusGroup.add(wrap);
   wrap.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(wrap);
-  const height = Math.max(1, box.max.z);
+  const height = Math.max(1, box.max.y);
   for (const mesh of campusGroup.children) {
     if (mesh.userData.building?.properties.buildingId !== id) continue;
     mesh.visible = false;
-    mesh.scale.z = height / (mesh.userData.height || height);
+    mesh.scale.y = height / (mesh.userData.height || height);
   }
   const indoor = campusBuildings.get(id);
   if (indoor) {
     indoor.box = box;
     indoor.fill1 = undefined; // its screen fill was measured against the white-model box
     indoor.modelMats = modelMats;
-    if (indoor.label) indoor.label.local.setZ(height + 1.1);
+    if (indoor.label) indoor.label.local.setY(height + 1.1);
   }
   lastCampusBlend = null; // apply the current fade to the new materials
   campusBox = null;
@@ -1547,7 +1569,7 @@ function showCampus({ animate = true, land = 'building' } = {}) {
     poseCamera(fitCamera, fit);
     const fill1 = boxScreenFill(entry.box, fitCamera);
     const zoom = THREE.MathUtils.clamp(CAMPUS_NAV.landFill / Math.max(fill1, 1e-3), CAMPUS_NAV.minZoom, CAMPUS_NAV.maxZoom);
-    pose = { ...fit, target: entry.box.getCenter(new THREE.Vector3()).setZ(0), zoom };
+    pose = { ...fit, target: entry.box.getCenter(new THREE.Vector3()).setY(0), zoom };
     setCampusFocus({ id: buildingId, via: 'return' });
   }
   goToPose(pose, animate, { locked: animate });
@@ -1573,10 +1595,10 @@ function safeInsets() {
 function poseCamera(cam, pose) {
   const d = pose.distance;
   const sinT = Math.sin(pose.tilt), cosT = Math.cos(pose.tilt);
-  // Ground direction that should read as "up" on screen.
-  const ux = -Math.sin(pose.heading), uy = Math.cos(pose.heading);
-  cam.position.set(pose.target.x - ux * d * sinT, pose.target.y - uy * d * sinT, pose.target.z + d * cosT);
-  cam.up.set(ux, uy, 0);
+  // Ground direction [x, z] that should read as "up" on screen (heading 0 = north = −z).
+  const ux = -Math.sin(pose.heading), uz = -Math.cos(pose.heading);
+  cam.position.set(pose.target.x - ux * d * sinT, pose.target.y + d * cosT, pose.target.z - uz * d * sinT);
+  cam.up.set(ux, 0, uz);
   cam.lookAt(pose.target);
   const aspect = root.clientWidth / Math.max(1, root.clientHeight);
   const h = pose.orthoHeight / pose.zoom;
@@ -1720,22 +1742,22 @@ function fitCurrent(animate) {
   else goToPose(computeFit(floorBoxAt(floors.get(focusFloor), 'floor3d'), 'floor3d'), animate);
 }
 
-// Point on the horizontal plane at height z under a screen position (orthographic, so always defined).
-function groundPoint(clientX, clientY, z) {
+// Point on the horizontal plane at height y under a screen position (orthographic, so always defined).
+function groundPoint(clientX, clientY, y) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
   const { origin, direction } = raycaster.ray;
-  if (Math.abs(direction.z) < 1e-6) return null;
-  const t = (z - origin.z) / direction.z;
+  if (Math.abs(direction.y) < 1e-6) return null;
+  const t = (y - origin.y) / direction.y;
   return origin.clone().addScaledVector(direction, t);
 }
 
-function focusPlaneZ() {
+function focusPlaneY() {
   if (currentView === 'campus') return 0;
   const f = floors.get(focusFloor);
-  return f ? f.group.position.z + .1 : 0;
+  return f ? f.group.position.y + .1 : 0;
 }
 
 function isNavigableView() {
@@ -1748,19 +1770,19 @@ function clampTarget() {
   if (!f && currentView !== 'campus') return;
   const box = currentView === 'campus' ? (campusBox ??= new THREE.Box3().setFromObject(campusGroup)) : floorBoxAt(f, 'now');
   viewState.target.x = THREE.MathUtils.clamp(viewState.target.x, box.min.x, box.max.x);
-  viewState.target.y = THREE.MathUtils.clamp(viewState.target.y, box.min.y, box.max.y);
+  viewState.target.z = THREE.MathUtils.clamp(viewState.target.z, box.min.z, box.max.z);
 }
 
 // Change zoom/heading while keeping the floor point under (clientX, clientY) fixed on screen.
 function setViewAnchored(changes, clientX, clientY, anchorWorld = null) {
-  const z = focusPlaneZ();
-  const before = anchorWorld || groundPoint(clientX, clientY, z);
+  const y = focusPlaneY();
+  const before = anchorWorld || groundPoint(clientX, clientY, y);
   Object.assign(viewState, changes);
   updateCamera();
-  const after = groundPoint(clientX, clientY, z);
+  const after = groundPoint(clientX, clientY, y);
   if (before && after) {
     viewState.target.x += before.x - after.x;
-    viewState.target.y += before.y - after.y;
+    viewState.target.z += before.z - after.z;
     clampTarget();
     updateCamera();
   }
@@ -1814,10 +1836,10 @@ function revealSelectedRoom(animate) {
   const left = r.left + inset.left, right = r.right - inset.right, top = r.top + inset.top, bottom = r.bottom - inset.bottom;
   const m = REVEAL_MARGIN_PX;
   if (sx >= left + m && sx <= right - m && sy >= top + m && sy <= bottom - m) return true;
-  const from = groundPoint(sx, sy, c.z), to = groundPoint((left + right) / 2, (top + bottom) / 2, c.z);
+  const from = groundPoint(sx, sy, c.y), to = groundPoint((left + right) / 2, (top + bottom) / 2, c.y);
   if (!from || !to) return false;
   const target = viewState.target.clone();
-  target.x += from.x - to.x; target.y += from.y - to.y;
+  target.x += from.x - to.x; target.z += from.z - to.z;
   const adjusted = viewState.userAdjusted;
   goToPose({ target, heading: viewState.heading, tilt: viewState.tilt, orthoHeight: viewState.orthoHeight, zoom: viewState.zoom }, animate);
   viewState.userAdjusted = adjusted; // a pan to keep the room in sight is not a reframing
@@ -1937,13 +1959,13 @@ const labelWorld = new THREE.Vector3();
 function labelPosition(l) {
   labelWorld.copy(l.local);
   if (l.between) {
-    const [a, b] = l.between.map(id => floors.get(id)?.group.position.z);
+    const [a, b] = l.between.map(id => floors.get(id)?.group.position.y);
     if (a === undefined || b === undefined) return null;
-    labelWorld.z += (a + b) / 2;
+    labelWorld.y += (a + b) / 2;
   } else if (l.floor && l.role !== 'campus') {
     const f = floors.get(l.floor);
     if (!f) return null;
-    labelWorld.z += f.group.position.z;
+    labelWorld.y += f.group.position.y;
   }
   return labelWorld;
 }
@@ -2108,7 +2130,7 @@ function startPinch() {
   gesture = {
     type: 'pinch', moved: true, ...p, dist0: p.dist, angle0: p.angle,
     zoom0: viewState.zoom, heading0: viewState.heading,
-    anchor: isNavigableView() ? groundPoint(p.midX, p.midY, focusPlaneZ()) : null,
+    anchor: isNavigableView() ? groundPoint(p.midX, p.midY, focusPlaneY()) : null,
     lastMidX: p.midX, lastMidY: p.midY,
   };
   cancelTween();
@@ -2325,9 +2347,9 @@ on(renderer.domElement, 'pointermove', e => {
       setViewAnchored({ heading: headingAfterRotate(viewState.heading, -dx * .006) }, root.getBoundingClientRect().left + root.clientWidth / 2, root.getBoundingClientRect().top + root.clientHeight / 2);
     } else {
       // Pan: the floor point under the pointer follows it.
-      const z = focusPlaneZ();
-      const a = groundPoint(gesture.lastX, gesture.lastY, z), b = groundPoint(e.clientX, e.clientY, z);
-      if (a && b) { viewState.target.x += a.x - b.x; viewState.target.y += a.y - b.y; clampTarget(); updateCamera(); }
+      const y = focusPlaneY();
+      const a = groundPoint(gesture.lastX, gesture.lastY, y), b = groundPoint(e.clientX, e.clientY, y);
+      if (a && b) { viewState.target.x += a.x - b.x; viewState.target.z += a.z - b.z; clampTarget(); updateCamera(); }
     }
     viewState.userAdjusted = true;
     debugPanel?.sync();
@@ -2505,7 +2527,10 @@ async function start() {
     return;
   }
   if (destroyed) return;
-  WORLD_ORIGIN = geoBounds(campusFeatures());
+  // campusFeatures() projects (radius filter), so a lonlat source needs its reference first.
+  if (FRAME !== 'planar-cm') LONLAT_REF = geoBounds(buildingsData.features.filter(f => f.properties.campusId === 'A'));
+  campusBounds = geoBounds(campusFeatures());
+  if (FRAME !== 'planar-cm') LONLAT_REF = campusBounds;
   renderer.setSize(root.clientWidth, root.clientHeight, false);
   started = true;
   if (ENTRY_VIEW === 'campus') {
