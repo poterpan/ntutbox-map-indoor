@@ -20,6 +20,11 @@ function floorDoc(floor) {
   const spaces = [{ id: `TB/${floor}/c`, c: '505', t: '走廊', g: [rect(0, 1500, 4000, 500)] }];
   (ROOMS[floor] || []).forEach((n, i) => spaces.push({ id: `TB/${floor}/${n}`, c: '001', n, t: '教室', g: [rect(i * 1200 + 100, 100, 1000, 1200)] }));
   spaces.push({ id: `TB/${floor}/s`, c: '503', t: '樓梯', g: [rect(3600, 100, 300, 600)] });
+  // 2F: a named office (no classroom) and a storage room sharing its door number.
+  if (floor === '2F') {
+    spaces.push({ id: 'TB/2F/201', c: '005', n: '201', t: '學生輔導中心辦公室', te: 'Student Counseling Center', g: [rect(100, 100, 1000, 1200)] });
+    spaces.push({ id: 'TB/2F/201#2', c: '005', n: '201', t: '儲藏室', g: [rect(1300, 100, 500, 500)] });
+  }
   return { schema_version: 1, building: 'TB', floor, spaces };
 }
 function fixtureSource() {
@@ -192,4 +197,91 @@ test('dispose frees every geometry and material and detaches the group', async (
   assert.equal(layer.object.parent, null);
   assert.equal(layer.object.children.length, 0);
   assert.equal(await layer.setPresentation({ building: null }), false);
+});
+
+test('stackFloors all: every floor in the overview, no skip markers, badges from badgeText (null hides)', async () => {
+  assert.deepEqual(overviewIds(list, { all: true }), FLOORS);
+  const { y, skips } = stackLayout(list, { gap: 10, all: true });
+  assert.deepEqual(skips, []);
+  close(y.get('5F'), 50);
+  const layer = make({ stackFloors: 'all', badgeText: f => (f.id === '3F' ? null : f.id) });
+  await layer.load('TB');
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 8 });
+  layer.update(1 / 60);
+  const labels = layer.labels();
+  assert.ok(!labels.some(l => l.role === 'skip'), 'no skip markers');
+  assert.equal(labels.find(l => l.id === 'badge:TB/2F').text, '2F', 'floors without classrooms get a badge');
+  assert.equal(labels.find(l => l.id === 'badge:TB/2F').opacity, 1);
+  assert.equal(labels.find(l => l.id === 'badge:TB/3F').opacity, 0, 'badgeText null: no badge');
+  const box = new THREE.Box3();
+  for (const id of FLOORS) box.union(layer.floorBox('TB', id));
+  assert.ok(layer.buildingBox('TB').equals(box), 'stack box spans every floor');
+  close(layer.floorBox('TB', '5F').min.y - layer.floorBox('TB', 'B1').min.y, 40);
+  assert.throws(() => make({ stackFloors: 'some' }), /stackFloors/);
+  layer.dispose();
+});
+
+test('SpaceInfo: keys, space(), spaces(); default selectable = classrooms only', async () => {
+  const layer = make();
+  await layer.load('TB');
+  const office = layer.space('TB/2F/201');
+  assert.equal(office.type, '學生輔導中心辦公室');
+  assert.equal(office.typeEn, 'Student Counseling Center');
+  assert.equal(office.number, '201');
+  assert.equal(office.category, '005');
+  assert.equal(office.cls, 'service');
+  assert.equal(office.selectable, false);
+  assert.equal(layer.space('TB/2F/201#2').type, '儲藏室', 'a second space with the same number keeps its GIS id');
+  assert.equal(layer.space('TB/1F/101').selectable, true);
+  const all = layer.spaces('TB');
+  assert.equal(new Set(all.map(s => s.key)).size, all.length);
+  assert.ok(all.some(s => s.key === 'TB/2F/c' && s.cls === 'corridor'));
+  assert.deepEqual(layer.spaces('XX'), []);
+  await layer.setPresentation({ building: 'TB', mode: 'floor', floor: '2F', focusY: 0, floorGap: 3.2 });
+  layer.update(1 / 60);
+  const ray = new THREE.Raycaster();
+  ray.set(new THREE.Vector3(6, 50, -6), new THREE.Vector3(0, -1, 0));
+  const hit = layer.pick(ray);
+  assert.equal(hit.kind, 'space', 'not selectable by default');
+  assert.equal(hit.space.key, 'TB/2F/201');
+  layer.dispose();
+});
+
+test('host hooks: selectable, spaceClass, spaceLabel make a named office a room with a label and card data', async () => {
+  const layer = make({
+    stackFloors: 'all',
+    selectable: s => s.cls === 'classroom' || (s.type && !/儲藏|走廊|樓梯/.test(s.type)),
+    spaceClass: s => (s.cls === 'service' && s.type !== '儲藏室' ? 'room' : null),
+    spaceLabel: s => (s.cls === 'classroom' ? { text: s.number } : s.selectable ? { text: s.type, priority: 2.7, kind: 'place', fadeIn: [4, 6] } : null),
+  });
+  await layer.load('TB');
+  await layer.setPresentation({ building: 'TB', mode: 'floor', floor: '2F', focusY: 0, floorGap: 3.2 });
+  layer.update(1 / 60);
+  const ray = new THREE.Raycaster();
+  ray.set(new THREE.Vector3(6, 50, -6), new THREE.Vector3(0, -1, 0));
+  const hit = layer.pick(ray);
+  assert.equal(hit.kind, 'room');
+  assert.equal(hit.key, 'TB/2F/201');
+  assert.equal(hit.cls, 'room');
+  assert.equal(hit.space.type, '學生輔導中心辦公室');
+  assert.equal(hit.object.material[0].color.getHex(), DEFAULT_PALETTE.place);
+  assert.ok(layer.roomBox('TB/2F/201'));
+  layer.setSelected('TB/2F/201');
+  assert.notEqual(hit.object.material[0].color.getHex(), DEFAULT_PALETTE.place, 'selection tints');
+  layer.setSelected(null);
+  assert.equal(hit.object.material[0].color.getHex(), DEFAULT_PALETTE.place, 'and restores the place colour');
+  const labels = layer.labels();
+  const office = labels.find(l => l.id === 'room:TB/2F/201');
+  assert.equal(office.text, '學生輔導中心辦公室');
+  assert.equal(office.kind, 'place');
+  assert.equal(office.priority, 2.7);
+  assert.deepEqual(office.fadeIn, [4, 6]);
+  assert.equal(office.opacity, 1);
+  assert.ok(!labels.some(l => l.text === '樓梯'), 'spaceLabel replaces the default labels');
+  assert.equal(labels.find(l => l.id === 'room:TB/1F/101').kind, 'unknown', 'classrooms keep their status kind');
+  // Occupancy still recolours classrooms and leaves the office alone.
+  layer.setOccupancy(new Map([['TB/1F/101', { status: 'free' }], ['TB/1F/102', { status: 'busy' }], ['TB/B1/B01', { status: 'busy' }], ['TB/4F/401', { status: 'busy' }]]));
+  assert.equal(layer.labels().find(l => l.id === 'room:TB/1F/101').kind, 'free');
+  assert.equal(layer.labels().find(l => l.id === 'room:TB/2F/201').kind, 'place');
+  layer.dispose();
 });

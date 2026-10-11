@@ -7,5 +7,5 @@ export {
 export type {
   IndoorLayer, IndoorLayerOptions, IndoorLabel, IndoorLabelRole, IndoorPalette, PickResult, Presentation, PresentationMode,
   PresentationOptions, BuildingConfig, BuildingIndexEntry, CampusData, CdnCampusData, CampusSource, FloorStats, HasStatus,
-  MapError, ModelManifest, ModelManifestEntry, ModelSource, Occupancy, OccupancyRecord, RoomInfo, RoomStatus,
+  MapError, ModelManifest, ModelManifestEntry, ModelSource, Occupancy, OccupancyRecord, RoomInfo, RoomStatus, SpaceInfo, SpaceClass, SpaceLabelSpec,
 } from '../index.js';

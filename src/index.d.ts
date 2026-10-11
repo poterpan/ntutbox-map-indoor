@@ -200,6 +200,45 @@ export interface IndoorPalette {
   focusEdge: number;
   /** Selection / hover tint and selection outline. */
   accent: number;
+  /** Spaces a host draws as rooms (spaceClass → 'room'). */
+  place: number; placeSide: number;
+}
+
+/** Space class: how a space is drawn. 'room' (a named non-classroom place drawn like a room) only comes from spaceClass. */
+export type SpaceClass = 'classroom' | 'room' | 'corridor' | 'vertical' | 'restroom' | 'service';
+
+/** One drawn indoor space (split GIS polygons of one room share a key). Read-only. */
+export interface SpaceInfo {
+  /** Classrooms "B/F/classNumber"; other spaces "B/F/number" for a number's primary space, else their GIS id ("B/F/501#2", "B/F/~hash"). */
+  readonly key: string;
+  readonly buildingId: string;
+  readonly floorId: string;
+  /** GIS space id (CDN `id`). */
+  readonly id: string | null;
+  /** CDN `t`: a type (教室, 研究室, 男廁…) or a proper name (學生輔導中心辦公室, 國家太空中心…). */
+  readonly type: string | null;
+  /** CDN `te`: English name / category, often missing. */
+  readonly typeEn: string | null;
+  /** CDN `n`: room / door number. */
+  readonly number: string | null;
+  /** CDN `c`: GIS category code (001 / 002 classrooms, 501 restrooms, 503 elevators, 504 stairs, 505 corridors…). */
+  readonly category: string | null;
+  readonly cls: SpaceClass | string;
+  /** m², of the largest polygon piece. */
+  readonly area: number;
+  /** selectable(space) at build time: has a key in pick / setSelected / roomBox. */
+  readonly selectable: boolean;
+}
+
+/** What spaceLabel returns: replaces the default labels (room numbers, 電梯／樓梯／WC). */
+export interface SpaceLabelSpec {
+  text: string;
+  /** Collision order, higher first. Default as for the built-in labels. */
+  priority?: number;
+  /** Label kind for classFor. Default: the room status for classrooms, else 'poi' (density declutter). */
+  kind?: string;
+  /** Fade in between these screen densities [from, to] (px per metre), e.g. to hide long names on small rooms until zoomed in. */
+  fadeIn?: [number, number];
 }
 
 export type PresentationMode = 'inplace' | 'stack' | 'floor';
@@ -213,7 +252,7 @@ export interface PresentationOptions {
   floor?: string | null;
   /** Stack: distance between overview floors (m). Default 3 × floorHeight. Changing it only re-lays out. */
   stackGap?: number;
-  /** Stack: extra gap, as a fraction of stackGap, where floors without classrooms were skipped. Default .45. */
+  /** Stack: extra gap, as a fraction of stackGap, where floors without classrooms were skipped (stackFloors 'classrooms'). Default .45. */
   skipExtra?: number;
   /** Floor: spacing per storey around the focused floor. Default floorHeight. */
   floorGap?: number;
@@ -242,14 +281,16 @@ export interface Presentation {
 }
 
 export interface PickResult {
-  /** 'room' a classroom; 'space' any other space or a wall (cls 'wall'); 'floor' a slab. */
+  /** 'room' a selectable space (default: classrooms); 'space' any other space or a wall (cls 'wall'); 'floor' a slab. */
   kind: 'room' | 'space' | 'floor';
   building: string;
   floor: string;
-  /** "buildingId/floorId/classNumber" for rooms. */
+  /** Selectable space key ("buildingId/floorId/classNumber" for classrooms). */
   key?: string;
-  /** Space class: classroom | corridor | vertical | restroom | service | wall. */
+  /** Space class: classroom | room | corridor | vertical | restroom | service | wall. */
   cls?: string;
+  /** The space hit (rooms and spaces; null for walls). */
+  space?: SpaceInfo | null;
   point: Vector3;
   distance: number;
   object: Object3D;
@@ -276,6 +317,9 @@ export interface IndoorLabel {
   readonly floor?: string;
   /** Badges: that floor's stats. */
   readonly stats?: FloorStats;
+  /** Host labels (spaceLabel): the space's key, and its density fade. */
+  readonly space?: string;
+  readonly fadeIn?: [number, number];
 }
 
 export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
@@ -297,6 +341,19 @@ export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
   lonlatOrigin?: { lon: number; lat: number } | (() => { lon: number; lat: number });
   /** 'floor-missing' when a floor file is absent. Load failures reject load() instead. */
   onError?: (error: MapError) => void;
+  /** Floors in the stack overview: 'classrooms' (default; floors without classrooms are skipped with a marker) or 'all'. */
+  stackFloors?: 'classrooms' | 'all';
+  /** Stack badge text per floor; null = no badge. Default "4F · 3/10 沒排課". Called again on setOccupancy. */
+  badgeText?: (floor: FloorStats) => string | null;
+  /** Which spaces are selectable (key, pick kind 'room', tint, outline). Default: classrooms. Evaluated at build time. */
+  selectable?: (space: SpaceInfo) => boolean;
+  /** Label per space (once per key); null = none. Replaces the default labels except the 正門 marker. */
+  spaceLabel?: (space: SpaceInfo) => SpaceLabelSpec | null;
+  /** Where stack badges sit along the depth of the overview's left edge: 'middle' (default) or 'near' the camera
+   *  (perspective hosts: the near edge is the leftmost on screen, so badges never overlap the floors). */
+  badgeAnchor?: 'middle' | 'near';
+  /** Override how a space is drawn; return null to keep the default class. 'room' = drawn like a room in the place colour. */
+  spaceClass?: (space: SpaceInfo) => SpaceClass | null;
 }
 
 export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
@@ -336,6 +393,10 @@ export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
   /** Ground points [x, z] of what the stack shows (footprint + overview floor hulls), to derive a stack gap. */
   outlinePoints(buildingId: string): [number, number][];
   room(key: string): RoomInfo<O> | null;
+  /** Any drawn space of a loaded building by key (selectable or not). */
+  space(key: string): SpaceInfo | null;
+  /** Every drawn space of a loaded building, one per key (for search). [] when not loaded. */
+  spaces(buildingId: string): SpaceInfo[];
   /** Labels of the shown building for this frame. */
   labels(): readonly IndoorLabel[];
   dispose(): void;
@@ -358,6 +419,8 @@ export interface OverlayLabel {
   priority?: number;
   opacity: number;
   floor?: string;
+  /** Fade in between these screen densities [from, to] (px per metre). */
+  fadeIn?: [number, number];
 }
 
 export interface LabelOverlayOptions<L extends OverlayLabel = OverlayLabel> {

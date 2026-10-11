@@ -101,6 +101,8 @@ export function createLabelOverlay(container, options = {}) {
       if (l.kind === 'poi' && op >= .02) {
         op *= THREE.MathUtils.smoothstep(opts.pixelsPerMetre(camera, l.position, H), opts.declutter.poiFrom, opts.declutter.poiTo);
       }
+      // Per-label declutter (host labels): fade in between these screen densities (px per metre).
+      if (l.fadeIn && op >= .02) op *= THREE.MathUtils.smoothstep(opts.pixelsPerMetre(camera, l.position, H), l.fadeIn[0], l.fadeIn[1]);
       if (op < .02) { if (st.el.style.visibility !== 'hidden') st.el.style.visibility = 'hidden'; st.collided = false; continue; }
       const p = projected.copy(l.position).project(camera);
       if (!(p.z > -1 && p.z < 1)) { st.el.style.visibility = 'hidden'; continue; }

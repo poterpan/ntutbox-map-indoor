@@ -3,8 +3,9 @@
 // Every layout returns Map<floorId, y> of each floor's base (its slab top sits at y + .06).
 
 // Floors shown in the stack overview: those with classrooms. A building with no timetabled rooms
-// (行政大樓, 圖書館…) still has an overview: all of its floors.
-export function overviewIds(floors) {
+// (行政大樓, 圖書館…) still has an overview: all of its floors. `all`: every floor (wayfinding hosts).
+export function overviewIds(floors, { all = false } = {}) {
+  if (all) return floors.map(f => f.id);
   const withRooms = floors.filter(f => f.total > 0).map(f => f.id);
   return withRooms.length ? withRooms : floors.map(f => f.id);
 }
@@ -34,8 +35,8 @@ export function inplaceLayout(floors, { floorHeight, groundY = 0 }) {
 // between two shown floors adds `skipExtra` × gap and becomes a skip marker ("7F–13F 沒有教室").
 // Floors hidden in the overview sit squeezed next to their nearest shown floor, so they grow out of it
 // during the accordion transition. Returns { y, shown, skips: [{ between: [below, above], ids }] }.
-export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0 }) {
-  const ids = overviewIds(floors);
+export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = false }) {
+  const ids = overviewIds(floors, { all });
   const byId = new Map(floors.map(f => [f.id, f]));
   const y = new Map();
   const skips = [];

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { allCoords, createProjector, geoBounds } from '../data/frame.js';
 import {
-  DEFAULT_BUILDINGS, loadCampus, roomSignature, roomStatus, sortedFloorIds, statsForFloor, toOccupancyMap,
+  DEFAULT_BUILDINGS, classifyFeature, loadCampus, roomKey, roomSignature, roomStatus, sortedFloorIds, statsForFloor, toOccupancyMap,
 } from '../data/indoor.js';
 import { DEFAULT_PALETTE, WALL, buildFloor, disposeTree, statusColors } from './geometry.js';
 import { elevation as elevationOf, floorLayout, floorRunLabel, inplaceLayout, overviewIds, stackLayout } from './layout.js';
@@ -41,7 +41,20 @@ export function createIndoorLayer(options = {}) {
     renderOrderBase: 0,
     onError: null,
     lonlatOrigin: null,
+    // Host hooks (docs/LAYER.md「宿主掛鉤」). Defaults reproduce the course site exactly.
+    stackFloors: 'classrooms',
+    badgeText: null,
+    selectable: null,
+    spaceLabel: null,
+    spaceClass: null,
+    badgeAnchor: 'middle',
     ...options,
+  };
+  if (!['classrooms', 'all'].includes(opts.stackFloors)) throw new TypeError(`createIndoorLayer: stackFloors must be 'classrooms' or 'all'`);
+  const ALL_FLOORS = opts.stackFloors === 'all';
+  const isSelectable = opts.selectable || (info => info.cls === 'classroom');
+  const hook = (name, fallback, ...args) => {
+    try { return opts[name](...args); } catch (err) { console.error(`[indoor-layer] ${name} failed`, err); return fallback; }
   };
   const source = opts.source;
   if (!source) throw new TypeError('createIndoorLayer: options.source is required');
@@ -116,7 +129,7 @@ export function createIndoorLayer(options = {}) {
         const rec = {
           id, group: new THREE.Group(), order, floors: new Map(), datas: Object.fromEntries(order.map((f, i) => [f, datas[i]])),
           feature: data.buildingsData.features.find(f => f.properties.buildingId === id) || null,
-          sig: null, labels: [], skipMarkers: [], footprintM: [],
+          sig: null, labels: [], skipMarkers: [], footprintM: [], spaces: new Map(),
         };
         rec.group.name = `indoor-${id}`;
         rec.group.visible = false;
@@ -134,15 +147,57 @@ export function createIndoorLayer(options = {}) {
     rec.floors = new Map();
   }
 
+  // SpaceInfo of every drawn space of one floor (Map feature → info; rec.spaces: key → info).
+  // Keys: classrooms "B/F/classNumber" (as always); other spaces "B/F/number" when they are that number's
+  // primary space (GIS id "B/F/number", or the first one with it), otherwise their own GIS id ("B/F/501#2",
+  // "B/F/~hash"); spaces without an id get "B/F/#n".
+  function floorSpaces(rec, floorId, features) {
+    const byFeature = new Map();
+    const prefix = `${rec.id}/${floorId}/`;
+    const primary = new Map();
+    for (const f of features) {
+      const p = f.properties, n = p.classNumber;
+      if (n && (!primary.has(n) || p.spaceId === prefix + n)) primary.set(n, p.name ?? null);
+    }
+    features.forEach((f, i) => {
+      const p = f.properties;
+      let cls = classifyFeature(p, occupancy);
+      if (cls === 'skip' || cls === 'void') return;
+      const base = {
+        key: '', buildingId: rec.id, floorId, id: p.spaceId ?? null, type: p.name ?? null, typeEn: p.nameEn ?? null,
+        number: p.classNumber ?? null, category: p.category1 ?? null, cls, area: p.areaSquareMeters || 0, selectable: false,
+      };
+      if (opts.spaceClass) {
+        const c = hook('spaceClass', null, Object.freeze({ ...base }));
+        if (c) base.cls = cls = c;
+      }
+      base.key = cls === 'classroom' ? roomKey(p)
+        : p.classNumber && primary.get(p.classNumber) === (p.name ?? null) ? prefix + p.classNumber
+          : p.spaceId ? (String(p.spaceId).startsWith(prefix) ? String(p.spaceId) : `${prefix}#${p.spaceId}`) : `${prefix}#${i}`;
+      base.selectable = !!(opts.selectable ? hook('selectable', false, Object.freeze({ ...base })) : isSelectable(base));
+      const info = Object.freeze(base);
+      byFeature.set(f, info);
+      const prev = rec.spaces.get(info.key);
+      if (!prev || info.area > prev.area) rec.spaces.set(info.key, info); // split polygons: the largest piece
+    });
+    return byFeature;
+  }
+
   function buildBuilding(rec) {
     clearBuilding(rec);
     rec.sig = roomSignature(rec.id, occupancy);
     rec.footprintM = rec.feature ? allCoords(rec.feature.geometry).map(p => project(p)) : [];
+    rec.spaces = new Map();
     rec.order.forEach((floorId, index) => {
       const features = rec.datas[floorId]?.features || [];
+      const spaces = floorSpaces(rec, floorId, features);
+      const clsOf = new Map([...spaces].map(([f, info]) => [f.properties, info.cls]));
       const floor = buildFloor({
         buildingId: rec.id, floorId, index, features, occupancy, project, palette: COLORS, fog,
         receiveShadow: receiveShadows, footprintFeature: rec.feature, footprintM: rec.footprintM,
+        spaceOf: f => spaces.get(f) || null,
+        ...(opts.spaceClass ? { classify: p => clsOf.get(p) ?? classifyFeature(p, occupancy) } : {}),
+        ...(opts.spaceLabel ? { labelFor: info => hook('spaceLabel', null, info) } : {}),
       });
       floor.stats = statsForFloor(features, rec.id, floorId, occupancy);
       floor.y = 0;
@@ -152,7 +207,7 @@ export function createIndoorLayer(options = {}) {
     });
     // Floor badges, skip markers and the entrance marker. Badge anchors are placed per presentation.
     const list = floorList(rec);
-    const stack = stackLayout(list, { gap: 1 });
+    const stack = stackLayout(list, { gap: 1, all: ALL_FLOORS });
     rec.skipMarkers = stack.skips.map(s => ({
       id: `skip:${rec.id}/${s.between[0]}-${s.between[1]}`, local: new THREE.Vector3(), between: s.between,
       text: `${floorRunLabel(s.ids)} 沒有教室`, kind: 'skip', role: 'skip', priority: 0,
@@ -167,12 +222,12 @@ export function createIndoorLayer(options = {}) {
       let poi = 0;
       for (const l of f.labels) {
         l.id ??= l.key ? `room:${l.key}` : l.kind === 'entrance' ? `entrance:${rec.id}` : `poi:${rec.id}/${f.id}/${poi++}`;
-        l.priority = labelPriority(l);
+        l.priority ??= labelPriority(l);
         l.position = new THREE.Vector3();
         l.opacity = 0;
         rec.labels.push(l);
       }
-      if (f.stats.total) rec.labels.push(f.badge);
+      if (ALL_FLOORS || f.stats.total) rec.labels.push(f.badge);
     }
     for (const l of rec.skipMarkers) rec.labels.push(l);
     for (const l of [...rec.skipMarkers, ...[...rec.floors.values()].map(f => f.badge)]) { l.position ??= new THREE.Vector3(); l.opacity = 0; }
@@ -214,20 +269,25 @@ export function createIndoorLayer(options = {}) {
     return stats.available >= Math.max(3, Math.ceil(stats.total * .55)) ? 'open' : 'partial';
   }
   function updateBadge(f) {
-    f.badge.text = `${f.id} · ${f.stats.available}/${f.stats.total} 沒排課`;
+    if (opts.badgeText) {
+      const text = hook('badgeText', null, { id: f.id, ...f.stats });
+      f.badge.hidden = text == null;
+      f.badge.text = text == null ? '' : String(text);
+    } else f.badge.text = `${f.id} · ${f.stats.available}/${f.stats.total} 沒排課`;
     f.badge.kind = badgeKind(f.stats);
     f.badge.stats = f.stats;
   }
 
   const floorList = rec => rec.order.filter(id => rec.floors.has(id)).map((id, index) => ({ id, index: rec.floors.get(id).index, total: rec.floors.get(id).stats.total }));
-  const overviewSet = rec => new Set(overviewIds(floorList(rec)));
+  const overviewOf = rec => overviewIds(floorList(rec), { all: ALL_FLOORS });
+  const overviewSet = rec => new Set(overviewOf(rec));
 
   // Ground points [x, z] of everything the stack overview shows: the footprint plus the hull of every
   // overview floor that does not fit it. Hosts derive the stack gap for their camera from it.
   function outlinePoints(id) {
     const rec = built.get(id);
     if (!rec) return [];
-    return [...rec.footprintM, ...overviewIds(floorList(rec)).flatMap(fid => rec.floors.get(fid).hull || [])];
+    return [...rec.footprintM, ...overviewOf(rec).flatMap(fid => rec.floors.get(fid).hull || [])];
   }
 
   // Badge / skip-marker anchor: beside the overview's left edge as seen with `right` pointing screen-right.
@@ -238,7 +298,8 @@ export function createIndoorLayer(options = {}) {
     const up = [right[1], -right[0]];
     const us = pts.map(p => p[0] * up[0] + p[1] * up[1]), rs = pts.map(p => p[0] * right[0] + p[1] * right[1]);
     const uMin = Math.min(...us), uMax = Math.max(...us);
-    const rBadge = Math.min(...rs) - 1.2, uMid = (uMin + uMax) / 2;
+    // 'near': at the edge facing the camera, which under perspective is the stack's leftmost point on screen.
+    const rBadge = Math.min(...rs) - 1.2, uMid = opts.badgeAnchor === 'near' ? uMin + Math.min(4, (uMax - uMin) / 4) : (uMin + uMax) / 2;
     const x = right[0] * rBadge + up[0] * uMid, z = right[1] * rBadge + up[1] * uMid;
     for (const f of rec.floors.values()) f.badge.local.set(x, 0, z);
     for (const s of rec.skipMarkers) s.local.set(x, 0, z);
@@ -278,7 +339,7 @@ export function createIndoorLayer(options = {}) {
   function layoutFor(rec, p) {
     const list = floorList(rec);
     if (!p.building || p.mode === 'inplace') return inplaceLayout(list, { floorHeight: opts.floorHeight, groundY: opts.groundY });
-    if (p.mode === 'stack') return stackLayout(list, { gap: p.stackGap, skipExtra: p.skipExtra }).y;
+    if (p.mode === 'stack') return stackLayout(list, { gap: p.stackGap, skipExtra: p.skipExtra, all: ALL_FLOORS }).y;
     return floorLayout(list, p.floor, { focusY: p.focusY, floorGap: p.floorGap });
   }
 
@@ -482,7 +543,7 @@ export function createIndoorLayer(options = {}) {
   function buildingBox(id) {
     const rec = built.get(id);
     if (!rec) return null;
-    const ids = id === pres.building && pres.mode === 'stack' ? overviewIds(floorList(rec)) : [...rec.floors.keys()];
+    const ids = id === pres.building && pres.mode === 'stack' ? overviewOf(rec) : [...rec.floors.keys()];
     const box = new THREE.Box3();
     ids.forEach(fid => box.union(floorBox(id, fid)));
     return box;
@@ -519,6 +580,16 @@ export function createIndoorLayer(options = {}) {
       occupancy: occupancy?.get(key) || null,
     };
   }
+  // Any drawn space of a loaded building (selectable or not), by key.
+  function space(key) {
+    const [b] = String(key).split('/');
+    return built.get(b)?.spaces.get(String(key)) ?? null;
+  }
+  // Every drawn space of a loaded building, one entry per key, floors bottom to top.
+  function spaces(id) {
+    const rec = built.get(id);
+    return rec ? [...rec.spaces.values()] : [];
+  }
 
   // Label data of the shown building, world positions and opacities for the current frame. Room labels
   // are shown on the focused floor only; floor badges and skip markers belong to the stack. Pixel-density
@@ -541,7 +612,7 @@ export function createIndoorLayer(options = {}) {
         l.opacity = stackOpacity;
       } else {
         worldTmp.y += rec.floors.get(l.floor).group.position.y;
-        l.opacity = l.role === 'badge' ? stackOpacity : floorMode && l.floor === pres.floor ? arrive : 0;
+        l.opacity = l.role === 'badge' ? (l.hidden ? 0 : stackOpacity) : floorMode && l.floor === pres.floor ? arrive : 0;
       }
       l.position.copy(worldTmp).applyMatrix4(m);
     }
@@ -554,22 +625,22 @@ export function createIndoorLayer(options = {}) {
     if (!rec) return null;
     let targetsList;
     if (pres.mode === 'floor') targetsList = rec.floors.get(pres.floor)?.hitMeshes || [];
-    else if (pres.mode === 'stack') targetsList = overviewIds(floorList(rec)).flatMap(id => [rec.floors.get(id).slab, ...rec.floors.get(id).rooms].filter(Boolean));
+    else if (pres.mode === 'stack') targetsList = overviewOf(rec).flatMap(id => [rec.floors.get(id).slab, ...rec.floors.get(id).rooms].filter(Boolean));
     else targetsList = [...rec.floors.values()].map(f => f.slab).filter(Boolean);
     object.updateMatrixWorld(true);
     const hit = raycaster.intersectObjects(targetsList, false)[0];
     if (!hit) return null;
     const u = hit.object.userData;
     const base = { building: rec.id, floor: u.floorId, point: hit.point, distance: hit.distance, object: hit.object };
-    if (u.cls === 'classroom') return { kind: 'room', key: u.key, cls: u.cls, ...base };
+    if (u.key) return { kind: 'room', key: u.key, cls: u.cls, space: u.space ?? null, ...base };
     if (u.floorLayer) return { kind: 'floor', ...base };
-    return { kind: 'space', cls: u.wall ? 'wall' : u.cls, ...base };
+    return { kind: 'space', cls: u.wall ? 'wall' : u.cls, space: u.space ?? null, ...base };
   }
 
   // ---- room looks: status colour, hover / selection tint, emissive ----
   const tmpColor = new THREE.Color(), accent = new THREE.Color();
   function roomLook(mesh) {
-    const [top, side] = STATUS[mesh.userData.kind] || STATUS.unknown;
+    const [top, side] = mesh.userData.kind ? STATUS[mesh.userData.kind] || STATUS.unknown : mesh.userData.base || STATUS.unknown;
     const tint = mesh.userData.key === selectedKey ? SELECT_TINT : mesh.userData.key === hoverKey ? HOVER_TINT : 0;
     accent.setHex(COLORS.accent);
     mesh.material[0].color.setHex(top);
@@ -613,12 +684,13 @@ export function createIndoorLayer(options = {}) {
   function restyle(rec) {
     for (const f of rec.floors.values()) {
       for (const mesh of f.rooms) {
+        if (mesh.userData.cls !== 'classroom') continue;
         const kind = roomStatus(occupancy, mesh.userData.key);
         if (kind === mesh.userData.kind) continue;
         mesh.userData.kind = kind;
         roomLook(mesh);
       }
-      for (const l of f.labels) if (l.key) l.kind = roomStatus(occupancy, l.key);
+      for (const l of f.labels) if (l.key && l.status) l.kind = roomStatus(occupancy, l.key);
       f.stats = statsForFloor(rec.datas[f.id]?.features, rec.id, f.id, occupancy);
       updateBadge(f);
     }
@@ -720,6 +792,8 @@ export function createIndoorLayer(options = {}) {
     elevation,
     outlinePoints,
     room,
+    space,
+    spaces,
     labels,
     dispose,
   };

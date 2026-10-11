@@ -30,6 +30,9 @@ export const DEFAULT_PALETTE = {
   outline: 0x767c87,
   focusEdge: 0x4f5560,
   accent: 0x0a84ff,
+  // Named places a host draws as rooms (spaceClass → 'room'); the default classification never produces it.
+  place: 0xe4dcf2,
+  placeSide: 0xbfb2d9,
 };
 
 export function statusColors(palette) {
@@ -169,9 +172,14 @@ export function cleanWallOutline(ring) {
 
 // Builds one floor into a fresh group at y = 0. Returns the floor record the layer animates.
 //   ctx: { buildingId, floorId, index, features, occupancy, project, palette, fog, receiveShadow,
-//          footprintFeature, footprintM }
+//          footprintFeature, footprintM, classify?, spaceOf?, labelFor? }
+// Optional host hooks (the layer passes them; without them the floor is built exactly as before):
+//   classify(p) → space class ('room' = a named place: raised fill + edges in the `place` colour, no low walls);
+//   spaceOf(feature) → { key, selectable, … } (SpaceInfo); selectable spaces get a key, tint and outline;
+//   labelFor(info, cls) → { text, priority?, kind?, fadeIn? } | null, replacing the default labels.
 export function buildFloor(ctx) {
   const { floorId: id, features, occupancy, project, palette: COLORS, fog, receiveShadow } = ctx;
+  const spaceOf = ctx.spaceOf || (() => null);
   const STATUS = statusColors(COLORS);
   const group = new THREE.Group();
   group.userData.floorId = id;
@@ -181,7 +189,14 @@ export function buildFloor(ctx) {
     fade: 0, fadeTarget: 0, outline: null, outlineFade: 0, outlineTarget: 0, focusEdge: null, focusStyleK: undefined,
     localBox: null, badge: null,
   };
-  const classify = p => classifyFeature(p, occupancy);
+  const classify = ctx.classify || (p => classifyFeature(p, occupancy));
+  const isRoomCls = cls => cls === 'classroom' || cls === 'room';
+  // Selectable spaces carry a key: classrooms by default ("B/F/classNumber"), anything the host allows.
+  const keyOf = (feature, cls) => {
+    const info = spaceOf(feature);
+    if (info) return info.selectable ? info.key : null;
+    return cls === 'classroom' ? roomKey(feature.properties) : null;
+  };
   const lineMat = params => { const m = new THREE.LineBasicMaterial(params); m.fog = fog; return m; };
 
   // Walls already built on this floor, as collinear intervals. Adjacent rooms share boundaries, so without
@@ -240,20 +255,42 @@ export function buildFloor(ctx) {
       const kind = roomStatus(occupancy, roomKey(p));
       return { depth: .07, y: .10, mats: materialPair(...STATUS[kind], { fog }), kind };
     }
-    if (cls === 'corridor') return { depth: .035, y: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide, { fog }) };
-    if (cls === 'vertical') return { depth: .12, y: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide, { fog }) };
-    if (cls === 'restroom') return { depth: .10, y: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide, { fog }) };
+    if (cls === 'room') return { depth: .07, y: .10, mats: materialPair(COLORS.place, COLORS.placeSide, { fog }), base: [COLORS.place, COLORS.placeSide] };
+    if (cls === 'corridor') return { depth: .035, y: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide, { fog }), base: [COLORS.corridor, COLORS.corridorSide] };
+    if (cls === 'vertical') return { depth: .12, y: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide, { fog }), base: [COLORS.vertical, COLORS.verticalSide] };
+    if (cls === 'restroom') return { depth: .10, y: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide, { fog }), base: [COLORS.restroom, COLORS.restroomSide] };
     // Opaque: a semi-transparent space would let the faint neighbour floors bleed through the focused floor.
-    if (cls === 'service') return { depth: .065, y: .08, mats: materialPair(COLORS.service, COLORS.serviceSide, { fog }) };
+    if (cls === 'service') return { depth: .065, y: .08, mats: materialPair(COLORS.service, COLORS.serviceSide, { fog }), base: [COLORS.service, COLORS.serviceSide] };
     return null;
   };
 
-  const addFeatureLabels = (feature, cls) => {
+  // Host labels: one per space (split polygons share a key: labelled once, on the largest piece).
+  const hostLabel = (feature, cls, key) => {
+    const info = spaceOf(feature);
+    const spec = info && ctx.labelFor(info, cls);
+    if (!spec || !spec.text) return;
+    const p = feature.properties;
+    const status = cls === 'classroom' && spec.kind === undefined;
+    const label = {
+      local: centroidOfGeometry(feature.geometry, project).setY(isRoomCls(cls) ? LABEL_Y : .46),
+      text: String(spec.text), kind: spec.kind ?? (status ? roomStatus(occupancy, key || roomKey(p)) : 'poi'),
+      key: key || undefined, role: 'room', floor: id, area: p.areaSquareMeters || 0, space: info.key, status,
+    };
+    if (spec.priority !== undefined) label.priority = spec.priority;
+    if (spec.fadeIn) label.fadeIn = spec.fadeIn;
+    if (!key) label.id = `space:${info.key}`;
+    const i = floor.labels.findIndex(l => l.space === info.key);
+    if (i < 0) floor.labels.push(label);
+    else if (label.area > floor.labels[i].area) floor.labels[i] = label;
+  };
+
+  const addFeatureLabels = (feature, cls, key) => {
+    if (ctx.labelFor) { hostLabel(feature, cls, key); return; }
     const p = feature.properties;
     if (cls === 'classroom' && p.classNumber) {
       const c = centroidOfGeometry(feature.geometry, project);
       const key = roomKey(p);
-      const label = { local: c.setY(LABEL_Y + 0), text: p.classNumber, kind: roomStatus(occupancy, key), key, role: 'room', floor: id, area: p.areaSquareMeters || 0 };
+      const label = { local: c.setY(LABEL_Y + 0), text: p.classNumber, kind: roomStatus(occupancy, key), key, role: 'room', floor: id, area: p.areaSquareMeters || 0, status: true };
       // GIS sometimes splits one room into several polygons (CB 4F 414): colour all of them, label once,
       // on the largest piece.
       const i = floor.labels.findIndex(l => l.key === key);
@@ -274,14 +311,15 @@ export function buildFloor(ctx) {
     if (cls === 'skip' || cls === 'void') return;
     const style = styleFor(feature.properties, cls);
     if (!style) return;
+    const key = keyOf(feature, cls);
     for (const rings of ringsFromGeometry(feature.geometry)) {
       const shape = shapeFromRings(rings, project);
       if (!shape) continue;
       const geom = extrudeUp(shape, {
         depth: style.depth,
         bevelEnabled: false,
-        bevelSize: cls === 'classroom' ? .04 : .02,
-        bevelThickness: cls === 'classroom' ? .03 : .015,
+        bevelSize: isRoomCls(cls) ? .04 : .02,
+        bevelThickness: isRoomCls(cls) ? .03 : .015,
         bevelSegments: 1,
         curveSegments: 2,
       });
@@ -289,16 +327,20 @@ export function buildFloor(ctx) {
       mesh.position.y = style.y + 0;
       mesh.receiveShadow = receiveShadow;
       mesh.userData = {
-        feature, cls, kind: style.kind, floorId: id, key: cls === 'classroom' ? roomKey(feature.properties) : null,
-        caster: cls === 'classroom' || cls === 'vertical' || cls === 'restroom',
+        feature, cls, kind: style.kind, floorId: id, key,
+        caster: isRoomCls(cls) || cls === 'vertical' || cls === 'restroom',
       };
+      if (style.base) mesh.userData.base = style.base;
+      const info = spaceOf(feature);
+      if (info) mesh.userData.space = info;
       group.add(mesh);
-      if (cls === 'classroom') {
-        floor.rooms.push(mesh);
+      if (key) floor.rooms.push(mesh);
+      if (isRoomCls(cls)) {
         const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 25), lineMat({ color: COLORS.outline, transparent: true, opacity: .24 }));
         edge.position.y = style.y + 0 + .006;
         group.add(edge);
-        addRoomLowWalls(feature);
+        // Low walls only around classrooms: hosts may mark hundreds of places as 'room' (one draw call per wall).
+        if (cls === 'classroom') addRoomLowWalls(feature);
       } else if (cls === 'service' || cls === 'vertical' || cls === 'restroom') {
         // Plan-style boundaries between the many neutral spaces; only drawn on the focused floor.
         const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 25), lineMat({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }));
@@ -307,7 +349,7 @@ export function buildFloor(ctx) {
         group.add(edge);
       }
     }
-    addFeatureLabels(feature, cls);
+    addFeatureLabels(feature, cls, key);
   };
 
   // Slab outline. The official building footprint is used when the floor fits inside it (A3T); some
@@ -316,7 +358,7 @@ export function buildFloor(ctx) {
   floor.hull = slabOutline(features, ctx.footprintM, classify, project);
   floor.slab = addSlab(group, floor.hull, ctx.footprintFeature, project, COLORS, fog, receiveShadow, id);
 
-  const order = { corridor: 0, service: 1, vertical: 2, restroom: 3, classroom: 4, void: 8, skip: 9 };
+  const order = { corridor: 0, service: 1, vertical: 2, restroom: 3, classroom: 4, room: 4, void: 8, skip: 9 };
   features.slice().sort((a, b) => order[classify(a.properties)] - order[classify(b.properties)]).forEach(addFeature);
 
   group.traverse(n => {
