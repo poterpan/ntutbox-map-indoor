@@ -32,7 +32,7 @@ layer 不知道「真實高度」以外的版面意義，由宿主給參數：
 - `elevation(floorId)` = 樓層序 × `floorHeight` + `groundY`（1F 地板在 `groundY`，B1 為負）。
   樓層序 = 該層在排序後樓層清單中的位置 − 1F 的位置（夾層也算一層，與 0.11 校園轉場一致；沒有 1F 時以總覽最低層為 0）。
 - `inplace`：每層在 `elevation`（轉場起點；樓板外框為主，房間淡）。
-- `stack`：爆炸圖總覽，只列有教室的樓層（連續無教室樓層加 `skipExtra` 間距與「xF–yF 沒有教室」標記），
+- `stack`：爆炸圖總覽，預設只列有教室的樓層（`stackFloors: 'all'` 列全部，沒有跳層標記）（連續無教室樓層加 `skipExtra` 間距與「xF–yF 沒有教室」標記），
   層距 `stackGap` 由宿主給（viewer 依正交視角算；室外依透視自己給）。改 `stackGap` 只重排、不重建幾何。
   `skipExtra` 以 `stackGap` 為單位（預設 .45）。宿主要算層距時用 `outlinePoints(id)`（總覽顯示範圍的地面點）。
   樓層徽章與跳層標記排在總覽左緣：宿主用 `screenRight`（畫面右方的地面方向 [x, z]）告訴 layer 哪邊是左。
@@ -79,7 +79,7 @@ interface IndoorLayer {
   readonly presentation: Presentation;      // 目標（落地後的）版面
   readonly animating: boolean;              // presentation 動畫中
   update(dt: number): boolean;              // 不收相機；回傳 true = 還在動（含淡入淡出）
-  pick(raycaster): PickResult | null;       // {kind:'room'|'space'|'floor', building, floor, key?, cls?}
+  pick(raycaster): PickResult | null;       // {kind:'room'|'space'|'floor', building, floor, key?, cls?, space?}；room＝selectable
   setOccupancy(o: Occupancy | null): boolean;  // 0.12 改材質色；教室集合變了才重建（回傳 true）
   setHoveredFloor(floorId | null): void;    // stack 模式 hover 淡化（現在的 setStackHover）
   setHovered(key | null): void;
@@ -104,6 +104,33 @@ interface IndoorLayer {
 - `inplace` 的樣子：每層填色 .18、樓板外框 .55，不顯示樓層徽章（徽章只屬於 stack）。
 - 已顯示 A 時直接 `setPresentation({ building: 'B', animate: true })`：A 立刻隱藏，B 照 `null → B` 從 inplace 淡入。
 
+## 宿主掛鉤（0.12 第二輪，2026-10-12）
+
+排課站（找空教室）與 map.ntutbox.com（找路：教室、系辦、辦公室、研究室）要的東西不同。套件只提供通用掛鉤，
+語意（哪些空間算地點、標籤怎麼寫）留在宿主。**全部不給＝現在的排課站行為，像素不變**（視覺基準守住）。
+
+```ts
+createIndoorLayer({
+  stackFloors?: 'classrooms' | 'all',          // 預設 classrooms：只列有教室的樓層＋「xF–yF 沒有教室」；all：每層都列、沒有跳層標記
+  badgeText?: (floor: FloorStats) => string | null,  // 徽章字；null＝這層不顯示徽章。setOccupancy 後會再叫（可帶狀態）
+  selectable?: (space: SpaceInfo) => boolean,  // 預設只有教室；能選的空間有 key、pick 回 kind 'room'、可 setSelected／roomBox
+  spaceLabel?: (space: SpaceInfo) => { text, priority?, kind?, fadeIn? } | null,  // 取代預設標籤（正門除外），每個 key 一個
+  spaceClass?: (space: SpaceInfo) => SpaceClass | null,  // 改畫法；'room'＝具名地點：place 色、教室高度、邊線（不加矮牆）
+  badgeAnchor?: 'middle' | 'near',             // 透視宿主用 near：徽章在總覽靠相機那側，不壓到下面的樓層
+})
+layer.space(key): SpaceInfo | null             // 已載入棟的任何空間（能不能選都有）
+layer.spaces(buildingId): SpaceInfo[]          // 一個 key 一筆；之後給搜尋用
+```
+
+- `SpaceInfo`：`{ key, buildingId, floorId, id, type (CDN t), typeEn (te), number (n), category (c), cls, area, selectable }`。
+  `t` 可能是類型（教室、研究室、男廁）也可能是專有名稱（學生輔導中心辦公室、國家太空中心），宿主自己判斷。
+- key：教室維持 `B/F/房號`；其他空間是該房號的「主空間」（GIS id 就是 `B/F/房號`）時用 `B/F/房號`，否則用自己的 GIS id
+  （`B/F/501#2`、`B/F/~hash`）。同一房號分成多塊多邊形的同名空間共用一個 key（標籤只標最大那塊）。
+- `selectable`／`spaceClass` 在建幾何時算；`setOccupancy` 讓教室集合變了才重建，非教室的地點不受佔用影響。
+- `spaceLabel` 不給 `kind` 時：教室用佔用狀態（free／busy…，宿主之後接 `setOccupancy` 就有顏色），其他是 `poi`（密度淡出）。
+  `fadeIn: [from, to]`（每公尺像素）由 overlay 處理：房間小、名稱長的標籤放大到放得下才淡入。
+- 'room' 不加矮牆：宿主可能標幾百間（每段牆一個 draw call；AM 整棟 2733 → 2092 calls）。
+
 ## Overlay API
 
 ```ts
@@ -112,6 +139,7 @@ createLabelOverlay(container, {
 }): { update(camera, labels), sync(labels), maxWidth(filter?), element(id), clear(), dispose() }
 ```
 
+- 標籤可帶 `fadeIn: [from, to]`（每公尺像素）：在這段密度間淡入（宿主掛鉤 `spaceLabel` 用）。
 - 每幀 `update(camera, [...layer.labels(), ...宿主自己的標籤])`；正交、透視相機都可（px/m 依相機種類算）。
 - 以 `id` 做差量：只有出現、消失、文字或 class 變了的標籤才動 DOM；文件順序＝清單順序。
 
