@@ -4,7 +4,7 @@ import {
   DEFAULT_BUILDINGS, classifyFeature, loadCampus, roomKey, roomSignature, roomStatus, sortedFloorIds, statsForFloor, toOccupancyMap,
 } from '../data/indoor.js';
 import { DEFAULT_PALETTE, buildFloor, disposeTree, extrudeUp, fillMaterial, paintRanges, statusColors } from './geometry.js';
-import { elevation as elevationOf, floorLayout, floorRunLabel, inplaceLayout, overviewIds, stackLayout } from './layout.js';
+import { clampWindow, elevation as elevationOf, floorLayout, floorRunLabel, groundIndex, inplaceLayout, overviewIds, stackLayout } from './layout.js';
 
 // IndoorLayer: the indoor floors of one or more buildings as a THREE.Group plus the state machine that lays
 // them out and fades them (docs/LAYER.md). It never touches a renderer, a camera or the DOM: the host adds
@@ -50,8 +50,10 @@ export function createIndoorLayer(options = {}) {
     badgeAnchor: 'middle',
     ...options,
   };
-  if (!['classrooms', 'all'].includes(opts.stackFloors)) throw new TypeError(`createIndoorLayer: stackFloors must be 'classrooms' or 'all'`);
-  const ALL_FLOORS = opts.stackFloors === 'all';
+  const GROUPING = typeof opts.stackFloors === 'function' ? opts.stackFloors : null;
+  if (!GROUPING && !['classrooms', 'all'].includes(opts.stackFloors)) throw new TypeError(`createIndoorLayer: stackFloors must be 'classrooms', 'all' or a function`);
+  // 'all' and a grouping function lay the stack out as entries (one per floor, or host-grouped runs).
+  const ENTRIES = GROUPING || opts.stackFloors === 'all';
   const isSelectable = opts.selectable || (info => info.cls === 'classroom');
   const hook = (name, fallback, ...args) => {
     try { return opts[name](...args); } catch (err) { console.error(`[indoor-layer] ${name} failed`, err); return fallback; }
@@ -221,17 +223,25 @@ export function createIndoorLayer(options = {}) {
       if (floor.outline) rec.group.add(floor.outline);
       rec.floors.set(floorId, floor);
     });
+    rec.entries = ENTRIES ? stackEntriesOf(rec) : null;
     // Floor badges, skip markers and the entrance marker. Badge anchors are placed per presentation.
     const list = floorList(rec);
-    const stack = stackLayout(list, { gap: 1, all: ALL_FLOORS });
+    const stack = stackLayout(list, { gap: 1, entries: rec.entries });
     rec.skipMarkers = stack.skips.map(s => ({
       id: `skip:${rec.id}/${s.between[0]}-${s.between[1]}`, local: new THREE.Vector3(), between: s.between,
       text: `${floorRunLabel(s.ids)} 沒有教室`, kind: 'skip', role: 'skip', priority: 0,
     }));
+    const entryOf = new Map((rec.entries || []).map(e => [e.id, e]));
     for (const f of rec.floors.values()) {
+      f.entry = entryOf.get(f.id) || null;
       f.badge = { id: `badge:${rec.id}/${f.id}`, local: new THREE.Vector3(), text: '', kind: '', role: 'badge', floor: f.id, priority: 0 };
       updateBadge(f);
     }
+    // Windowed stack: "more floors below / above" hints (badge role: hosts can make them scroll the window).
+    rec.more = rec.entries ? ['below', 'above'].map(side => ({
+      id: `more:${rec.id}/${side}`, local: new THREE.Vector3(), text: '', kind: 'more', role: 'badge', more: side, priority: 0,
+      position: new THREE.Vector3(), opacity: 0,
+    })) : [];
     addEntranceMarker(rec);
     rec.labels = [];
     for (const f of rec.floors.values()) {
@@ -243,9 +253,10 @@ export function createIndoorLayer(options = {}) {
         l.opacity = 0;
         rec.labels.push(l);
       }
-      if (ALL_FLOORS || f.stats.total) rec.labels.push(f.badge);
+      if (rec.entries ? f.entry : f.stats.total) rec.labels.push(f.badge);
     }
     for (const l of rec.skipMarkers) rec.labels.push(l);
+    for (const l of rec.more) rec.labels.push(l);
     for (const l of [...rec.skipMarkers, ...[...rec.floors.values()].map(f => f.badge)]) { l.position ??= new THREE.Vector3(); l.opacity = 0; }
     rec.anchorRight = null;
     rec.roomIndex = new Map();
@@ -282,22 +293,53 @@ export function createIndoorLayer(options = {}) {
     });
   }
 
+  // Stack entries bottom to top: { id (the floor drawn for the entry), floors, collapsed, label }. 'all': one per
+  // floor. A grouping function returns floor ids and arrays of floor ids (a collapsed run, drawn as one compact
+  // slot by its floor nearest the ground); floors it leaves out are hidden in the stack.
+  function stackEntriesOf(rec) {
+    const ids = rec.order.filter(id => rec.floors.has(id));
+    const single = ids.map(id => ({ id, floors: [id], collapsed: false, label: id }));
+    if (!GROUPING) return single;
+    const byFloor = new Map(ids.map(id => [id, []]));
+    for (const sp of rec.spaces.values()) byFloor.get(sp.floorId)?.push(sp);
+    const infos = ids.map(id => Object.freeze({ id, ...rec.floors.get(id).stats, spaces: Object.freeze(byFloor.get(id)) }));
+    const out = hook('stackFloors', null, infos, rec.id);
+    const pos = new Map(ids.map((id, i) => [id, i]));
+    let last = -1, ok = Array.isArray(out);
+    const entries = ok ? out.map(item => {
+      const floors = [].concat(item);
+      for (const id of floors) { const i = pos.get(id); if (i === undefined || i <= last) ok = false; else last = i; }
+      return { floors, collapsed: Array.isArray(item) };
+    }) : [];
+    if (!ok || !entries.length || entries.some(e => !e.floors.length)) {
+      if (out !== null) console.error(`[indoor-layer] stackFloors returned an invalid grouping for ${rec.id}; showing every floor`);
+      return single;
+    }
+    const list = floorList(rec), ground = groundIndex(list);
+    return entries.map(e => {
+      const id = e.collapsed ? e.floors.reduce((a, b) => (Math.abs(pos.get(b) - ground) < Math.abs(pos.get(a) - ground) ? b : a)) : e.floors[0];
+      return Object.freeze({ id, floors: Object.freeze(e.floors), collapsed: e.collapsed, label: floorRunLabel(e.floors) });
+    });
+  }
+
   function badgeKind(stats) {
     if (stats.available === 0) return 'full';
     return stats.available >= Math.max(3, Math.ceil(stats.total * .55)) ? 'open' : 'partial';
   }
   function updateBadge(f) {
+    const group = f.entry?.collapsed ? f.entry.floors : null;
     if (opts.badgeText) {
-      const text = hook('badgeText', null, { id: f.id, ...f.stats });
+      const text = hook('badgeText', null, group ? { id: f.id, ...f.stats, floors: group } : { id: f.id, ...f.stats });
       f.badge.hidden = text == null;
       f.badge.text = text == null ? '' : String(text);
-    } else f.badge.text = `${f.id} · ${f.stats.available}/${f.stats.total} 沒排課`;
-    f.badge.kind = badgeKind(f.stats);
+    } else f.badge.text = group ? f.entry.label : `${f.id} · ${f.stats.available}/${f.stats.total} 沒排課`;
+    f.badge.kind = badgeKind(f.stats) + (group ? ' collapsed' : '');
+    f.badge.floors = group || undefined;
     f.badge.stats = f.stats;
   }
 
   const floorList = rec => rec.order.filter(id => rec.floors.has(id)).map((id, index) => ({ id, index: rec.floors.get(id).index, total: rec.floors.get(id).stats.total }));
-  const overviewOf = rec => overviewIds(floorList(rec), { all: ALL_FLOORS });
+  const overviewOf = rec => (rec.entries ? rec.entries.map(e => e.id) : overviewIds(floorList(rec)));
   const overviewSet = rec => new Set(overviewOf(rec));
 
   // Ground points [x, z] of everything the stack overview shows: the footprint plus the hull of every
@@ -321,6 +363,7 @@ export function createIndoorLayer(options = {}) {
     const x = right[0] * rBadge + up[0] * uMid, z = right[1] * rBadge + up[1] * uMid;
     for (const f of rec.floors.values()) f.badge.local.set(x, 0, z);
     for (const s of rec.skipMarkers) s.local.set(x, 0, z);
+    for (const s of rec.more) s.local.set(x, 0, z);
   }
 
   // ---- presentation ----
@@ -344,6 +387,8 @@ export function createIndoorLayer(options = {}) {
       building, mode, floor: mode === 'floor' ? (p.floor ?? null) : null,
       stackGap: p.stackGap ?? h * 3, skipExtra: p.skipExtra ?? .45, floorGap: p.floorGap ?? h,
       focusY: p.focusY, screenRight: p.screenRight ?? null,
+      // Windowed stack (entries mode): which entries show; null = all.
+      stackWindow: mode === 'stack' && rec?.entries ? clampWindow(p.stackWindow, rec.entries.length) : null,
       animate: !!p.animate, duration: p.duration ?? 650, easing: p.easing ?? easeInOutCubic,
     };
     if (!['inplace', 'stack', 'floor'].includes(mode)) throw new Error(`unknown presentation mode ${mode}`);
@@ -357,7 +402,11 @@ export function createIndoorLayer(options = {}) {
   function layoutFor(rec, p) {
     const list = floorList(rec);
     if (!p.building || p.mode === 'inplace') return inplaceLayout(list, { floorHeight: opts.floorHeight, groundY: opts.groundY });
-    if (p.mode === 'stack') return stackLayout(list, { gap: p.stackGap, skipExtra: p.skipExtra, all: ALL_FLOORS }).y;
+    if (p.mode === 'stack') {
+      const st = stackLayout(list, { gap: p.stackGap, skipExtra: p.skipExtra, entries: rec.entries, window: p.stackWindow });
+      rec.stackVis = st.vis || null;
+      return st.y;
+    }
     return floorLayout(list, p.floor, { focusY: p.focusY, floorGap: p.floorGap });
   }
 
@@ -418,6 +467,11 @@ export function createIndoorLayer(options = {}) {
     return promise;
   }
 
+  // Visibility of an overview floor in the stack window (1 without a window).
+  function windowVis(rec, floorId) {
+    return pres.mode === 'stack' && pres.stackWindow && rec.stackVis ? rec.stackVis.get(floorId) ?? 0 : 1;
+  }
+
   function setFadeTargets() {
     const rec = shown ? built.get(shown) : null;
     if (!rec) return;
@@ -427,7 +481,7 @@ export function createIndoorLayer(options = {}) {
     const flying = !!tween;
     for (const f of rec.floors.values()) {
       let t = 0, o = 0;
-      if (mode === 'stack' || mode === 'leave') t = overview.has(f.id) ? (mode === 'stack' && hoverFloor && hoverFloor !== f.id ? STYLE.hoverFade : 1) : 0;
+      if (mode === 'stack' || mode === 'leave') t = overview.has(f.id) ? (mode === 'stack' && hoverFloor && hoverFloor !== f.id ? STYLE.hoverFade : 1) * windowVis(rec, f.id) : 0;
       else if (mode === 'inplace') { t = STYLE.inplaceFill; o = STYLE.inplaceOutline; }
       const neighbour = !!focus && Math.abs(f.index - focus.index) === 1;
       if (focus) t = f === focus ? 1 : neighbour && flying ? STYLE.neighborFade : 0;
@@ -576,7 +630,7 @@ export function createIndoorLayer(options = {}) {
   function buildingBox(id) {
     const rec = built.get(id);
     if (!rec) return null;
-    const ids = id === pres.building && pres.mode === 'stack' ? overviewOf(rec) : [...rec.floors.keys()];
+    const ids = id === pres.building && pres.mode === 'stack' ? overviewOf(rec).filter(f => windowVis(rec, f) >= .5) : [...rec.floors.keys()];
     const box = new THREE.Box3();
     ids.forEach(fid => box.union(floorBox(id, fid)));
     return box;
@@ -612,6 +666,19 @@ export function createIndoorLayer(options = {}) {
       occupancy: occupancy?.get(key) || null,
     };
   }
+  // Floors (not entries) outside a stack window, below or above it.
+  function moreFloors(rec, win, side) {
+    const i0 = Math.round(win.start), i1 = i0 + win.size;
+    const list = side === 'below' ? rec.entries.slice(0, i0) : rec.entries.slice(i1);
+    return list.reduce((n, e) => n + e.floors.length, 0);
+  }
+  // Stack entries bottom to top (see stackEntriesOf); 'classrooms': one per overview floor.
+  function stackEntries(id) {
+    const rec = built.get(id);
+    if (!rec) return [];
+    return rec.entries ? [...rec.entries] : overviewOf(rec).map(f => Object.freeze({ id: f, floors: Object.freeze([f]), collapsed: false, label: f }));
+  }
+
   // Any drawn space of a loaded building (selectable or not), by key.
   function space(key) {
     const [b] = String(key).split('/');
@@ -636,15 +703,25 @@ export function createIndoorLayer(options = {}) {
     const arrive = smoothstep(blend, .55, 1);
     // Equals (1 − blend) between stack and floor; inplace keeps badges off.
     const stackOpacity = Math.min(stackness, 1 - blend) * smoothstep(presence, .5, 1);
+    const win = pres.building === rec.id && pres.mode === 'stack' ? pres.stackWindow : null;
     for (const l of rec.labels) {
       worldTmp.copy(l.local);
-      if (l.between) {
+      if (l.more) {
+        // "N more floors below / above" just outside the window's bottom / top entry.
+        const n = win ? moreFloors(rec, win, l.more) : 0;
+        l.opacity = n ? stackOpacity : 0;
+        if (n) {
+          l.text = l.more === 'below' ? `下面還有 ${n} 層` : `上面還有 ${n} 層`;
+          const edge = rec.entries[l.more === 'below' ? Math.round(win.start) : Math.round(win.start) + win.size - 1];
+          worldTmp.y += rec.floors.get(edge.id).group.position.y + (l.more === 'below' ? -.75 : .6) * pres.stackGap;
+        }
+      } else if (l.between) {
         const [a, b] = l.between.map(id => rec.floors.get(id).group.position.y);
         worldTmp.y += (a + b) / 2;
         l.opacity = stackOpacity;
       } else {
         worldTmp.y += rec.floors.get(l.floor).group.position.y;
-        l.opacity = l.role === 'badge' ? (l.hidden ? 0 : stackOpacity) : floorMode && l.floor === pres.floor ? arrive : 0;
+        l.opacity = l.role === 'badge' ? (l.hidden ? 0 : stackOpacity * (win ? rec.stackVis?.get(l.floor) ?? 0 : 1)) : floorMode && l.floor === pres.floor ? arrive : 0;
       }
       l.position.copy(worldTmp).applyMatrix4(m);
     }
@@ -659,7 +736,7 @@ export function createIndoorLayer(options = {}) {
     if (!rec) return null;
     const mode = pres.mode;
     const list = mode === 'floor' ? [rec.floors.get(pres.floor)].filter(Boolean)
-      : mode === 'stack' ? overviewOf(rec).map(id => rec.floors.get(id)) : [...rec.floors.values()];
+      : mode === 'stack' ? overviewOf(rec).filter(id => windowVis(rec, id) >= .5).map(id => rec.floors.get(id)) : [...rec.floors.values()];
     object.updateMatrixWorld(true);
     let best = null;
     const consider = (hit, f, piece) => { if (!best || hit.distance < best.hit.distance) best = { hit, f, piece }; };
@@ -838,6 +915,7 @@ export function createIndoorLayer(options = {}) {
     floors,
     elevation,
     outlinePoints,
+    stackEntries,
     room,
     space,
     spaces,

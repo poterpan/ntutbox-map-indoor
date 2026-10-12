@@ -397,3 +397,100 @@ test('host hooks: selectable, spaceClass, spaceLabel make a named office a room 
   assert.equal(layer.labels().find(l => l.id === 'room:TB/2F/201').kind, 'place');
   layer.dispose();
 });
+
+// Tall buildings (docs/LAYER.md「高樓」): host grouping collapses runs into compact entries; a window scrolls.
+const noClassrooms = floors => {
+  const out = [];
+  let run = null;
+  for (const f of floors) {
+    if (f.spaces.some(s => s.selectable)) { run = null; out.push(f.id); } else if (run) run.push(f.id); else { run = [f.id]; out.push(run); }
+  }
+  return out;
+};
+
+test('stackFloors grouping: collapsed runs are compact entries drawn by their floor nearest the ground', async () => {
+  const layer = make({ stackFloors: noClassrooms });
+  await layer.load('TB');
+  assert.deepEqual(layer.stackEntries('TB').map(e => [e.id, e.floors.join(','), e.collapsed, e.label]), [
+    ['B1', 'B1', false, 'B1'], ['1F', '1F', false, '1F'], ['2F', '2F,3F', true, '2F–3F'], ['4F', '4F', false, '4F'], ['5F', '5F', true, '5F'],
+  ]);
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10 });
+  layer.update(1 / 60);
+  const base = id => layer.floorBox('TB', id).min.y - layer.floorBox('TB', 'B1').min.y;
+  close(base('1F'), 10);
+  close(base('2F'), 17.5, 'a collapsed entry takes half a slot');
+  close(base('4F'), 25);
+  close(base('5F'), 32.5);
+  close(base('3F'), 21.25, 'a hidden member sits between its neighbours');
+  const labels = layer.labels();
+  const badge = labels.find(l => l.id === 'badge:TB/2F');
+  assert.equal(badge.text, '2F–3F');
+  assert.match(badge.kind, /collapsed/);
+  assert.deepEqual(badge.floors, ['2F', '3F']);
+  assert.ok(!labels.some(l => l.id === 'badge:TB/3F'), 'one badge per entry');
+  assert.equal(labels.find(l => l.id === 'more:TB/above').opacity, 0, 'no hints without a window');
+  // badgeText sees the run.
+  const named = make({ stackFloors: noClassrooms, badgeText: f => (f.floors ? `${f.floors[0]}~${f.floors.at(-1)}` : f.id) });
+  await named.load('TB');
+  await named.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10 });
+  named.update(1 / 60);
+  assert.equal(named.labels().find(l => l.id === 'badge:TB/2F').text, '2F~3F');
+  named.dispose();
+  // An invalid grouping falls back to every floor.
+  const err = console.error; console.error = () => {};
+  const bad = make({ stackFloors: () => ['4F', '1F'] });
+  await bad.load('TB');
+  console.error = err;
+  assert.equal(bad.stackEntries('TB').length, 6);
+  bad.dispose();
+  layer.dispose();
+});
+
+test('stack window: only the window shows, its bottom entry at the base; hints count the hidden floors; fractional edges fade', async () => {
+  const layer = make({ stackFloors: noClassrooms });
+  await layer.load('TB');
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10, stackWindow: { start: 1, size: 3 } });
+  run(layer, 1);
+  assert.deepEqual(layer.presentation.stackWindow, { start: 1, size: 3 });
+  const y0 = layer.floorBox('TB', '1F').min.y;
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10 });
+  close(layer.floorBox('TB', 'B1').min.y, y0, 'the window\'s bottom entry stands where the first entry would');
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10, stackWindow: { start: 1, size: 3 } });
+  run(layer, 1);
+  close(layer.floorBox('TB', '2F').min.y - y0, 7.5);
+  close(layer.floorBox('TB', 'B1').min.y - y0, -10, 'B1 continues below, outside the window');
+  const box = new THREE.Box3();
+  for (const id of ['1F', '2F', '4F']) box.union(layer.floorBox('TB', id));
+  assert.ok(layer.buildingBox('TB').equals(box), 'the stack box is the window');
+  const labels = layer.labels();
+  const op = id => labels.find(l => l.id === id).opacity;
+  assert.equal(op('badge:TB/B1'), 0); assert.equal(op('badge:TB/5F'), 0);
+  assert.equal(op('badge:TB/1F'), 1); assert.equal(op('badge:TB/4F'), 1);
+  assert.equal(labels.find(l => l.id === 'more:TB/below').text, '下面還有 1 層');
+  assert.equal(labels.find(l => l.id === 'more:TB/above').text, '上面還有 1 層');
+  assert.equal(op('more:TB/below'), 1);
+  // Picking skips floors outside the window: from above, 4F is the top visible floor.
+  const ray = new THREE.Raycaster(new THREE.Vector3(30, 500, -17.5), new THREE.Vector3(0, -1, 0));
+  assert.equal(layer.pick(ray).floor, '4F');
+  // Scroll to the top (clamped), animated: lands, B1 and 1F out, 5F in.
+  assert.equal(await (async () => { const p = layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10, stackWindow: { start: 9, size: 3 }, animate: true, duration: 200 }); run(layer, .5); return p; })(), true);
+  assert.deepEqual(layer.presentation.stackWindow, { start: 2, size: 3 });
+  const l2 = layer.labels();
+  assert.equal(l2.find(l => l.id === 'more:TB/below').text, '下面還有 2 層');
+  assert.equal(l2.find(l => l.id === 'more:TB/above').opacity, 0);
+  assert.equal(l2.find(l => l.id === 'badge:TB/5F').opacity, 1);
+  // Dragging: a fractional start fades the edge entries.
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10, stackWindow: { start: 1.5, size: 3 } });
+  layer.update(1 / 60);
+  const l3 = layer.labels();
+  close(l3.find(l => l.id === 'badge:TB/1F').opacity, .5);
+  close(l3.find(l => l.id === 'badge:TB/5F').opacity, .5);
+  close(layer.floorBox('TB', '1F').min.y - y0, -3.75, 'slid half an entry down');
+  // The classrooms default ignores windows.
+  const plain = make();
+  await plain.load('TB');
+  await plain.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10, stackWindow: { start: 1, size: 2 } });
+  assert.equal(plain.presentation.stackWindow, null);
+  plain.dispose();
+  layer.dispose();
+});

@@ -258,6 +258,10 @@ export interface PresentationOptions {
   floorGap?: number;
   /** Floor: base height of the focused floor. Default max(elevation(floor), groundY). */
   focusY?: number;
+  /** Stack, entries mode (stackFloors 'all' or a function): show only entries start … start + size − 1 (entry
+   *  indices, bottom first). The window's bottom entry sits where the first entry would, so the camera can stay put
+   *  while the window scrolls; start may be fractional (dragging: the edge entries fade). Clamped; null = all. */
+  stackWindow?: { start: number; size: number } | null;
   /** Ground direction [x, z] pointing to the screen's right; floor badges and skip markers line up on the
    *  opposite (left) edge of the stack. Default: the previous value, else [1, 0] (east). */
   screenRight?: [number, number];
@@ -278,7 +282,31 @@ export interface Presentation {
   readonly floorGap: number;
   readonly focusY?: number;
   readonly screenRight: [number, number] | null;
+  /** Clamped stack window, or null. */
+  readonly stackWindow: { readonly start: number; readonly size: number } | null;
 }
+
+/** One entry of the stack overview, bottom to top. */
+export interface StackEntry {
+  /** The floor drawn for this entry (a collapsed run: its floor nearest the ground); badge id badge:B/<id>. */
+  readonly id: string;
+  /** Floors the entry stands for (one, or a collapsed run). */
+  readonly floors: readonly string[];
+  /** A run returned as an array by stackFloors: drawn in a compact slot, badge text "R1–R3". */
+  readonly collapsed: boolean;
+  /** "7F", or "R1–R3" for a run. */
+  readonly label: string;
+}
+
+/** What a stackFloors function gets per floor (bottom to top). */
+export interface StackFloorInfo extends FloorStats {
+  /** Every drawn space of the floor (selectable or not). */
+  readonly spaces: readonly SpaceInfo[];
+}
+
+/** Host grouping of the stack: floor ids, or arrays of floor ids (a collapsed run), bottom to top and in order.
+ *  Floors left out are hidden in the stack (no skip marker). An invalid result falls back to every floor. */
+export type StackGrouping = (floors: readonly StackFloorInfo[], buildingId: string) => ReadonlyArray<string | readonly string[]>;
 
 export interface PickResult {
   /** 'room' a selectable space (default: classrooms); 'space' any other space or a wall (cls 'wall'); 'floor' a slab. */
@@ -307,7 +335,7 @@ export interface IndoorLabel {
   readonly text: string;
   /** 'room' (room numbers, facilities, entrance), 'badge' (floor summary in the stack), 'skip' (floors without classrooms). */
   readonly role: IndoorLabelRole;
-  /** room: RoomStatus; facilities 'poi'; 'entrance'; badge 'open' | 'partial' | 'full'; 'skip'. */
+  /** room: RoomStatus; facilities 'poi'; 'entrance'; badge 'open' | 'partial' | 'full' (+ ' collapsed' for a run), 'more'; 'skip'. */
   readonly kind: string;
   /** Collision order, higher first (entrance 3, rooms 2–2.5 by area, facilities 1). */
   readonly priority: number;
@@ -317,6 +345,10 @@ export interface IndoorLabel {
   readonly floor?: string;
   /** Badges: that floor's stats. */
   readonly stats?: FloorStats;
+  /** Badge of a collapsed stack entry: the floors it stands for. */
+  readonly floors?: readonly string[];
+  /** Windowed stack hint (role 'badge', kind 'more', no floor): "下面還有 N 層" / "上面還有 N 層". */
+  readonly more?: 'below' | 'above';
   /** Host labels (spaceLabel): the space's key, and its density fade. */
   readonly space?: string;
   readonly fadeIn?: [number, number];
@@ -341,10 +373,12 @@ export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
   lonlatOrigin?: { lon: number; lat: number } | (() => { lon: number; lat: number });
   /** 'floor-missing' when a floor file is absent. Load failures reject load() instead. */
   onError?: (error: MapError) => void;
-  /** Floors in the stack overview: 'classrooms' (default; floors without classrooms are skipped with a marker) or 'all'. */
-  stackFloors?: 'classrooms' | 'all';
-  /** Stack badge text per floor; null = no badge. Default "4F · 3/10 沒排課". Called again on setOccupancy. */
-  badgeText?: (floor: FloorStats) => string | null;
+  /** Floors in the stack overview: 'classrooms' (default; floors without classrooms are skipped with a marker), 'all',
+   *  or a grouping function (collapsed runs; evaluated at build time). 'all' and functions allow stackWindow. */
+  stackFloors?: 'classrooms' | 'all' | StackGrouping;
+  /** Stack badge text per entry; null = no badge. Default "4F · 3/10 沒排課", a collapsed run "R1–R3" (`floors` set,
+   *  stats of the drawn floor). Called again on setOccupancy. */
+  badgeText?: (floor: FloorStats & { floors?: readonly string[] }) => string | null;
   /** Which spaces are selectable (key, pick kind 'room', tint, outline). Default: classrooms. Evaluated at build time. */
   selectable?: (space: SpaceInfo) => boolean;
   /** Label per space (once per key); null = none. Replaces the default labels except the 正門 marker. */
@@ -392,6 +426,8 @@ export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
   elevation(buildingId: string, floorId: string): number | null;
   /** Ground points [x, z] of what the stack shows (footprint + overview floor hulls), to derive a stack gap. */
   outlinePoints(buildingId: string): [number, number][];
+  /** The stack overview's entries, bottom to top ([] when not loaded). */
+  stackEntries(buildingId: string): StackEntry[];
   room(key: string): RoomInfo<O> | null;
   /** Any drawn space of a loaded building by key (selectable or not). */
   space(key: string): SpaceInfo | null;

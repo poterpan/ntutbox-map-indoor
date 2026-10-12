@@ -111,8 +111,9 @@ interface IndoorLayer {
 
 ```ts
 createIndoorLayer({
-  stackFloors?: 'classrooms' | 'all',          // 預設 classrooms：只列有教室的樓層＋「xF–yF 沒有教室」；all：每層都列、沒有跳層標記
-  badgeText?: (floor: FloorStats) => string | null,  // 徽章字；null＝這層不顯示徽章。setOccupancy 後會再叫（可帶狀態）
+  stackFloors?: 'classrooms' | 'all' | StackGrouping,  // 預設 classrooms：只列有教室的樓層＋「xF–yF 沒有教室」；all：每層都列、沒有跳層標記；
+                                               // 函式：宿主分組（見下「高樓」）
+  badgeText?: (floor: FloorStats & { floors? }) => string | null,  // 徽章字；null＝不顯示。收合的一格帶 floors。setOccupancy 後會再叫
   selectable?: (space: SpaceInfo) => boolean,  // 預設只有教室；能選的空間有 key、pick 回 kind 'room'、可 setSelected／roomBox
   spaceLabel?: (space: SpaceInfo) => { text, priority?, kind?, fadeIn? } | null,  // 取代預設標籤（正門除外），每個 key 一個
   spaceClass?: (space: SpaceInfo) => SpaceClass | null,  // 改畫法；'room'＝具名地點：place 色、教室高度、邊線（不加矮牆）
@@ -130,6 +131,27 @@ layer.spaces(buildingId): SpaceInfo[]          // 一個 key 一筆；之後給�
 - `spaceLabel` 不給 `kind` 時：教室用佔用狀態（free／busy…，宿主之後接 `setOccupancy` 就有顏色），其他是 `poi`（密度淡出）。
   `fadeIn: [from, to]`（每公尺像素）由 overlay 處理：房間小、名稱長的標籤放大到放得下才淡入。
 - 'room' 不加矮牆：宿主可能標幾百間，矮牆會蓋掉房間色（第二段時每段牆還是一個 draw call，AM 整棟 2733 → 2092 calls；第三段合併後牆不再影響 draw call，不加牆是畫法的選擇）。
+
+## 高樓：收合與視窗（0.12 第三輪，2026-10-12）
+
+AM（先鋒 21 層）這種高樓整棟擠不下：徽章疊在一起、手機上每層只剩一條線。兩個通用機制，預設都不開（排課站不變）：
+
+```ts
+type StackGrouping = (floors: StackFloorInfo[], buildingId) => Array<string | string[]>;
+// StackFloorInfo = FloorStats ＋ spaces（該層所有空間的 SpaceInfo）。由下往上、照順序；陣列＝收合的一段
+setPresentation({ mode: 'stack', stackWindow: { start, size } })  // 只顯示第 start … start+size−1 格（start 可帶小數＝拖曳中）
+layer.stackEntries(id): StackEntry[]   // { id（畫出來的那層）, floors, collapsed, label: '7F' | 'R1–R3' }
+```
+
+- **收合**：分組函式回傳的陣列是一格（單獨一層也可以），畫它離地面最近的那層（R1–R3 畫 R1、B4–B2 畫 B2），只佔半格高；
+  徽章字預設 `R1–R3`（`badgeText` 會收到 `floors`），kind 加 ` collapsed`。其他成員藏在它旁邊（換層時從那裡長出來）。
+  函式沒列到的樓層不顯示（沒有跳層標記）；結果不合法（順序錯、不認得的樓層）就退回每層一格並 console.error。
+  「哪些樓層算沒東西」是宿主的語意（map 用 placePolicy 的「有沒有可選地點」），套件不判斷。
+- **視窗**：`stackFloors` 是 `'all'` 或函式時可用（`'classrooms'` 忽略）。視窗最下面那格永遠放在第一格的位置，所以
+  捲動時相機不用動：樓層滑過一個固定的框，視窗外的淡出、不能點；`buildingBox` 只算視窗內。小數的 start 讓邊緣兩格半透明（拖曳）。
+  標籤多兩個「下面還有 N 層」／「上面還有 N 層」（role `badge`、kind `more`、`more: 'below' | 'above'`、沒有 floor；N 是樓層數不是格數），
+  宿主可以讓它點了就捲。
+- 視窗大小、何時開、怎麼捲（拖曳、滾輪、樓層軌）都是宿主決定。
 
 ## Overlay API
 

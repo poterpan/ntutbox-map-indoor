@@ -106,7 +106,8 @@ layer.floorBox('A3T', '2F');                    // 落地版面的世界 Box3，
 - `setOccupancy` 只重新上色；教室集合變了才重建該棟（回傳 `true`），版面不變。`setEmissive(k)` 讓夜間場景裡狀態色仍讀得出來。
 - three.js 必須是宿主那一份（peer dependency）；本地連結開發時在 Vite 設 `resolve.dedupe: ['three']`。型別在 `src/index.d.ts`（需要 `@types/three`）。
 - 範例：[`dev/layer.html`](dev/layer.html)＋[`dev/layer.js`](dev/layer.js)（透視相機、自己的燈光與霧、點選教室）。
-- 宿主掛鉤（預設＝排課站行為，不給就像素不變）：`stackFloors: 'all'`（總覽列出所有樓層）、`badgeText(floor)`（徽章字，null＝不顯示）、
+- 宿主掛鉤（預設＝排課站行為，不給就像素不變）：`stackFloors: 'all'`（總覽列出所有樓層）或分組函式（連續樓層收成一格「R1–R3」）、
+  `setPresentation({ stackWindow: { start, size } })`（高樓只顯示一段、可捲）、`stackEntries(id)`、`badgeText(floor)`（徽章字，null＝不顯示）、
   `selectable(space)`（哪些空間能選，預設只有教室）、`spaceLabel(space)`（標籤字／優先序／kind／`fadeIn` 密度淡入）、
   `spaceClass(space)`（`'room'`＝具名地點，用 `place` 色畫成房間）、`badgeAnchor: 'near'`（透視宿主）。`space(key)`／`spaces(id)` 回傳
   `SpaceInfo`（type＝CDN `t`、number＝`n`、category＝`c`）。細節在 [docs/LAYER.md](docs/LAYER.md)「宿主掛鉤」。

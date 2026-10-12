@@ -35,7 +35,10 @@ export function inplaceLayout(floors, { floorHeight, groundY = 0 }) {
 // between two shown floors adds `skipExtra` × gap and becomes a skip marker ("7F–13F 沒有教室").
 // Floors hidden in the overview sit squeezed next to their nearest shown floor, so they grow out of it
 // during the accordion transition. Returns { y, shown, skips: [{ between: [below, above], ids }] }.
-export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = false }) {
+// `entries` (host grouping, docs/LAYER.md「高樓」): [{ id, floors, collapsed }] bottom to top replaces the
+// overview subset; see entryLayout.
+export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = false, entries = null, collapsedSlot = COLLAPSED_SLOT, window = null }) {
+  if (entries) return entryLayout(floors, { gap, baseY, entries, collapsedSlot, window });
   const ids = overviewIds(floors, { all });
   const byId = new Map(floors.map(f => [f.id, f]));
   const y = new Map();
@@ -52,6 +55,16 @@ export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = fal
     y.set(id, slot * gap + baseY);
     prev = f;
   }
+  squeezeHidden(floors, ids, y, gap);
+  return { y, shown: ids, skips };
+}
+
+// A collapsed entry (a run of floors drawn as one compact slot) takes this fraction of a slot.
+export const COLLAPSED_SLOT = .5;
+
+// Floors that are not shown sit between their shown neighbours (or squeezed next to the last one).
+function squeezeHidden(floors, ids, y, gap) {
+  const byId = new Map(floors.map(f => [f.id, f]));
   const shown = ids.map(id => byId.get(id));
   for (const f of floors) {
     if (!shown.length || y.has(f.id)) continue;
@@ -62,7 +75,44 @@ export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = fal
     else if (below) y.set(f.id, by + (f.index - below.index) * gap * .08);
     else y.set(f.id, ay - (above.index - f.index) * gap * .08);
   }
-  return { y, shown: ids, skips };
+}
+
+// Clamps a stack window to n entries: { start (entry index, fractional while dragging), size }.
+export function clampWindow(win, n) {
+  if (!win || !n) return null;
+  const size = Math.max(1, Math.min(n, Math.round(win.size) || n));
+  const start = Math.max(0, Math.min(n - size, Number(win.start) || 0));
+  return { start, size };
+}
+
+// Host-grouped overview: one slot per entry, its representative floor `id` drawn there; a collapsed entry's
+// slot is `collapsedSlot` high. With a window only entries start … start + size − 1 show (visibility 0..1 at
+// fractional edges) and the window's bottom entry sits at baseY, so scrolling slides the floors through a
+// fixed frame. Returns { y, shown, skips: [], vis: Map<entry id, 0..1>, slots }.
+export function entryLayout(floors, { gap, baseY = 0, entries, collapsedSlot = COLLAPSED_SLOT, window = null }) {
+  const slots = [];
+  let s = 0, prevH = 0;
+  entries.forEach((e, i) => {
+    const h = e.collapsed ? collapsedSlot : 1;
+    if (i) s += (prevH + h) / 2;
+    slots.push(s);
+    prevH = h;
+  });
+  const win = clampWindow(window, entries.length);
+  let offset = 0;
+  const vis = new Map();
+  if (win) {
+    const i0 = Math.floor(win.start), fr = win.start - i0;
+    offset = slots[i0] + ((slots[i0 + 1] ?? slots[i0]) - slots[i0]) * fr;
+  }
+  const y = new Map();
+  entries.forEach((e, i) => {
+    y.set(e.id, (slots[i] - offset) * gap + baseY);
+    vis.set(e.id, win ? Math.max(0, Math.min(1, 1 - Math.max(0, win.start - i, i - (win.start + win.size - 1)))) : 1);
+  });
+  const ids = entries.map(e => e.id);
+  squeezeHidden(floors, ids, y, gap);
+  return { y, shown: ids, skips: [], vis, slots };
 }
 
 // Single floor, accordion style: the focused floor at focusY, every other floor floorGap per storey above
