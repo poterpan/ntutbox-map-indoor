@@ -129,7 +129,7 @@ layer.spaces(buildingId): SpaceInfo[]          // 一個 key 一筆；之後給�
 - `selectable`／`spaceClass` 在建幾何時算；`setOccupancy` 讓教室集合變了才重建，非教室的地點不受佔用影響。
 - `spaceLabel` 不給 `kind` 時：教室用佔用狀態（free／busy…，宿主之後接 `setOccupancy` 就有顏色），其他是 `poi`（密度淡出）。
   `fadeIn: [from, to]`（每公尺像素）由 overlay 處理：房間小、名稱長的標籤放大到放得下才淡入。
-- 'room' 不加矮牆：宿主可能標幾百間（每段牆一個 draw call；AM 整棟 2733 → 2092 calls）。
+- 'room' 不加矮牆：宿主可能標幾百間，矮牆會蓋掉房間色（第二段時每段牆還是一個 draw call，AM 整棟 2733 → 2092 calls；第三段合併後牆不再影響 draw call，不加牆是畫法的選擇）。
 
 ## Overlay API
 
@@ -143,21 +143,34 @@ createLabelOverlay(container, {
 - 每幀 `update(camera, [...layer.labels(), ...宿主自己的標籤])`；正交、透視相機都可（px/m 依相機種類算）。
 - 以 `id` 做差量：只有出現、消失、文字或 class 變了的標籤才動 DOM；文件順序＝清單順序。
 
-## 材質與效能
+## 材質與效能（第三段實作，2026-10-12）
 
-- 材質**每層共用**（每層約 8 個：教室、走廊、垂直動線、廁所、服務、牆、樓板、邊線），不跨樓層共用（淡入淡出是每層獨立的）。
-  底色白＋`vertexColors`。
-- 佔用狀態寫頂點色，`setOccupancy` 只更新 attribute。
-- `transparent` 會影響 shader 快取：材質建成透明、第一次 `update()` 後再切不透明，讓兩種 program 都在載入時編譯，不在飛行中卡頓。
-  `depthWrite = opacity > 0.6`。
-- 牆合併時以底部為 y=0 建，長高用 `mesh.scale.y`。
-- 拾取：每層一個合併的扁平代理，三角形→空間索引對照。
+- 每層幾個**合併 mesh**（`src/layer/geometry.js` 的 `buildFloor`），材質**每層一組**、不跨樓層共用（淡入淡出是每層獨立的）：
+  - `base`：樓板、走廊、服務空間（不投影）；`cast`：教室、具名地點、樓梯電梯、廁所（焦點層投影）；
+  - `walls`：所有矮牆，合併時底部在 y=0，mesh 站在 `WALL.base`、用 `mesh.scale.y` 長高（總覽 0.2 → 單層 1）；
+  - `edges`：房間邊線（.24）；`spaceEdges`：焦點樣式的空間邊界（預設 0、不畫）；`focusEdge`／`outline` 照舊各一條。
+  - 一層最多 5 個繪製物件（＋外框兩條 LineLoop），跟房間數無關。原本「每類一個材質、約 8 個」的規劃再合一步：
+    同一層的填色全部同一個 program，分類只差顏色，分開只會多 draw call；只依「投不投影」分兩桶。
+- 填色材質底色白＋`vertexColors`；狀態色（佔用、hover、選取微染、`spaceClass`、宿主 palette）寫進頂點色 attribute，
+  `setOccupancy`／`setHovered`／`setSelected` 只改該空間的頂點範圍（`addUpdateRange`，只上傳那一段），不重建、不換材質。
+- 夜間 emissive：材質 `emissive = 白 × k`，shader（`onBeforeCompile`）再乘頂點色，等於原本的「各空間顏色 × k」。
+- 頂面與側面：拉伸體的頂／底蓋（group 0）用上色、側面用側色，都在頂點色裡；粗糙度統一 .9（牆 .95）。
+- **透明／不透明**：材質建成透明；總覽（stack）落地、整層完全顯示時填色切成不透明（不混色、可提早深度剔除），
+  淡化（hover、inplace、鄰層、飛行中）就切回透明。單層模式的焦點層維持透明：它要畫在鄰層外框之後蓋住它們。
+  `transparent` 不同是兩個 shader program：layer 建立後前兩次 `update()` 期間多畫一個退化的不透明三角形，
+  兩種 program 在載入時就編好，不會在第一次落地時卡一下。`depthWrite = 透明度 > 0.6`。
+  宿主給了 `renderOrderBase`（＝要畫在自己的透明物件之後，例如 map 的半透明建築外殼）時一律維持透明：
+  那個順序只存在於透明 pass，切不透明會被外殼蓋一層。
+- 拾取：每層一個不畫的扁平代理（各空間頂面＋整塊樓板），`userData.pieces` 是三角形 → 空間的對照；
+  單層模式另外對合併的牆 mesh 做 raycast（打到牆回 `cls: 'wall'`）。`pick()` 的結果與第二段相同，`object` 改成代理或牆 mesh。
+- 選取外框（accent 輪廓）每次選取臨時重建該房間的 EdgesGeometry，固定 O(1) 個物件。
+- 量測（map.ntutbox.com，Mac、medium 品質，`pnpm shots` 的 perf；calls 含室外場景約 390）：
+  AM 整棟 2092 → 454 calls（室內本身 ~1700 → 60）、每幀 8.1 → 3.6 ms；A3T 4F 單層 366 → 289 calls、3.2 → 2.9 ms。
+  排課站視覺基準（rest-state）最大差 0.0012%。
 
 ## 0.12 實作註記（第二段）
 
-- 第二段**沒做**的（留給第三段，都在 `src/layer/` 內部）：材質仍是每間教室一組（狀態直接改材質色，不是頂點色）；
-  材質一律保持透明（沒做「先透明、第一次 update 後切不透明」的預編譯）；拾取仍對每個 mesh 做 raycast（沒有合併代理）；
-  牆仍是每段一個 BoxGeometry（已是底部對齊後以 `scale.y` 長高）。
+- 第二段留下的（每間一組材質、永遠透明、逐 mesh raycast、每段牆一個 BoxGeometry）第三段都做了，見上一節「材質與效能」。
 - viewer 傳給 `layer.update` 的是實際經過時間（不夾 0.1 s），讓 layer 的飛行與相機（照時鐘走）同時落地；
   viewer 的「飛行中」＝相機鎖定或 layer 的 presentation Promise 未決。
 - `?debug` 面板拿掉了 layer 內部的樣式滑桿（neighborFade、neighborOutline、outline、spaceEdges），常數改在
@@ -169,7 +182,7 @@ createLabelOverlay(container, {
 
 1. **Y-up 轉換**：只換座標框架與相機，不動結構。
 2. **API 拆分**：layer／overlay／viewer 成形；layer 加 `node --test` 單元測試（樓層位置、總覽子集、拾取索引、頂點色）。
-3. **合併幾何**：在 `src/layer/` 內部完成，API 不動。先在室外場景量手機 fps；每間教室一個 mesh 就跑得到 60 fps 的話，只做頂點色＋拾取代理。
+3. **合併幾何**（2026-10-12 完成）：在 `src/layer/` 內部完成，API 不動。map 標了幾百個具名地點後 AM 整棟 2092 calls，所以整套都做（見「材質與效能」）。
 
 ## 不在範圍
 

@@ -3,7 +3,7 @@ import { allCoords, createProjector, geoBounds } from '../data/frame.js';
 import {
   DEFAULT_BUILDINGS, classifyFeature, loadCampus, roomKey, roomSignature, roomStatus, sortedFloorIds, statsForFloor, toOccupancyMap,
 } from '../data/indoor.js';
-import { DEFAULT_PALETTE, WALL, buildFloor, disposeTree, statusColors } from './geometry.js';
+import { DEFAULT_PALETTE, buildFloor, disposeTree, extrudeUp, fillMaterial, paintRanges, statusColors } from './geometry.js';
 import { elevation as elevationOf, floorLayout, floorRunLabel, inplaceLayout, overviewIds, stackLayout } from './layout.js';
 
 // IndoorLayer: the indoor floors of one or more buildings as a THREE.Group plus the state machine that lays
@@ -65,6 +65,10 @@ export function createIndoorLayer(options = {}) {
   const receiveShadows = opts.shadows?.receive ?? true;
   const fog = !!opts.fog;
   const RO = opts.renderOrderBase || 0;
+  // Fills go opaque at rest (stack overview, fully shown): no blending, early depth rejection. A host that sets
+  // renderOrderBase draws the floors after its own transparent objects, an order that only exists in the
+  // transparent pass, so its floors stay transparent.
+  const OPAQUE_AT_REST = RO === 0;
   const emitError = e => { try { opts.onError?.(e); } catch (err) { console.error('[indoor-layer] onError handler failed', err); } };
 
   // lonlat sources are projected around a reference point: the host's (the viewer passes its campus
@@ -77,6 +81,18 @@ export function createIndoorLayer(options = {}) {
 
   const object = new THREE.Group();
   object.name = 'indoor-layer';
+  // Shader warm-up: fills switch between transparent and opaque, which are two programs. A degenerate opaque
+  // triangle drawn for the first frames compiles the opaque one at load, not when the first flight lands.
+  let warm = null, warmUpdates = 0;
+  if (OPAQUE_AT_REST) {
+    const g = new THREE.BufferGeometry();
+    for (const name of ['position', 'normal', 'color']) g.setAttribute(name, new THREE.BufferAttribute(new Float32Array(9), 3));
+    warm = new THREE.Mesh(g, fillMaterial({ fog, transparent: false }));
+    warm.frustumCulled = false;
+    warm.receiveShadow = receiveShadows;
+    warm.name = 'indoor-warmup';
+    object.add(warm);
+  }
   let occupancy = toOccupancyMap(opts.occupancy);
   let disposed = false;
 
@@ -233,9 +249,11 @@ export function createIndoorLayer(options = {}) {
     for (const l of [...rec.skipMarkers, ...[...rec.floors.values()].map(f => f.badge)]) { l.position ??= new THREE.Vector3(); l.opacity = 0; }
     rec.anchorRight = null;
     rec.roomIndex = new Map();
-    for (const f of rec.floors.values()) for (const m of f.rooms) {
-      if (!rec.roomIndex.has(m.userData.key)) rec.roomIndex.set(m.userData.key, []);
-      rec.roomIndex.get(m.userData.key).push(m);
+    for (const f of rec.floors.values()) for (const piece of f.pieces) {
+      if (!piece.key) continue;
+      piece.floor = f;
+      if (!rec.roomIndex.has(piece.key)) rec.roomIndex.set(piece.key, []);
+      rec.roomIndex.get(piece.key).push(piece);
     }
     applyRoomLooks(rec);
   }
@@ -385,6 +403,7 @@ export function createIndoorLayer(options = {}) {
       if (!next.building && shown) { built.get(shown).group.visible = false; shown = null; }
       setFadeTargets();
       if (target && next.building) { applyPositions(); applyFades(true); updateWalls(); updateFocusStyle(); }
+      applyOpacity();
       refreshSelection();
       return Promise.resolve(true);
     }
@@ -394,6 +413,7 @@ export function createIndoorLayer(options = {}) {
     tween = { t: 0, duration: Math.max(1, duration), easing, from, to, resolve };
     setFadeTargets();
     if (arriving) { for (const f of target.floors.values()) { f.fade = f.fadeTarget; f.outlineFade = f.outlineTarget; } applyPositions(); applyFades(true); }
+    applyOpacity();
     refreshSelection();
     return promise;
   }
@@ -477,7 +497,7 @@ export function createIndoorLayer(options = {}) {
       if (f.wallScale !== null && Math.abs(k - f.wallScale) < 1e-3) continue;
       f.wallScale = k;
       changed = true;
-      for (const w of f.walls) { w.scale.y = k; w.position.y = WALL.base + WALL.height * k / 2; }
+      if (f.meshes.walls) f.meshes.walls.scale.y = k; // built with its bottom at y = 0, standing at WALL.base
     }
     return changed;
   }
@@ -495,6 +515,17 @@ export function createIndoorLayer(options = {}) {
       for (const e of f.spaceEdges) { e.material.opacity = FOCUS_STYLE.spaceEdges * k; e.visible = k > .004 && FOCUS_STYLE.spaceEdges > 0; }
     }
     return changed;
+  }
+
+  // Fully shown overview floors at rest draw opaque; anything fading, flying or ghosted stays transparent.
+  function applyOpacity() {
+    const rec = shown ? built.get(shown) : null;
+    if (!rec || !OPAQUE_AT_REST) return;
+    const rest = !tween && pres.building === rec.id && pres.mode === 'stack' && lastVis === 1;
+    for (const f of rec.floors.values()) {
+      const opaque = rest && f.fade === 1 && f.fadeTarget === 1;
+      for (const m of f.fills) if (m.transparent === opaque) { m.transparent = !opaque; m.needsUpdate = true; }
+    }
   }
 
   function update(dt) {
@@ -527,6 +558,8 @@ export function createIndoorLayer(options = {}) {
     if (applyFades(dt)) moving = true;
     if (updateWalls()) moving = true;
     if (updateFocusStyle()) moving = true;
+    applyOpacity();
+    if (warm && ++warmUpdates > 2) { object.remove(warm); disposeTree(warm); warm = null; }
     return moving || !!tween;
   }
 
@@ -551,11 +584,10 @@ export function createIndoorLayer(options = {}) {
   function roomBox(key) {
     const [b] = String(key).split('/');
     const rec = built.get(b);
-    const mesh = rec?.roomIndex.get(key)?.[0];
-    if (!mesh) return null;
-    const f = rec.floors.get(mesh.userData.floorId);
-    mesh.updateWorldMatrix(true, false);
-    return new THREE.Box3().setFromObject(mesh).translate(new THREE.Vector3(0, floorTargetY(rec, f) - f.group.position.y, 0));
+    const piece = rec?.roomIndex.get(key)?.[0];
+    if (!piece) return null;
+    object.updateWorldMatrix(true, false);
+    return piece.box.clone().translate(new THREE.Vector3(0, floorTargetY(rec, piece.floor), 0)).applyMatrix4(object.matrixWorld);
   }
   function floors(id) {
     const rec = built.get(id);
@@ -570,13 +602,13 @@ export function createIndoorLayer(options = {}) {
   function room(key) {
     const [b] = String(key).split('/');
     const rec = built.get(b);
-    const mesh = rec?.roomIndex.get(key)?.[0];
-    if (!mesh) return null;
-    const p = mesh.userData.feature.properties;
-    const floorId = mesh.userData.floorId;
+    const piece = rec?.roomIndex.get(key)?.[0];
+    if (!piece) return null;
+    const p = piece.feature.properties;
+    const floorId = piece.floor.id;
     return {
       key, buildingId: b, buildingName: BUILDINGS[b]?.name ?? b, floorId, classNumber: p.classNumber,
-      gisName: p.name || p.use || '', status: mesh.userData.kind || 'unknown',
+      gisName: p.name || p.use || '', status: piece.kind || 'unknown',
       occupancy: occupancy?.get(key) || null,
     };
   }
@@ -620,81 +652,96 @@ export function createIndoorLayer(options = {}) {
   }
 
   // ---- picking ----
+  // Each floor has one flat proxy (space top faces + slab) whose triangles map to floor.pieces. Stack: slabs
+  // and selectable spaces; single floor: any space, or a wall (the merged wall mesh); inplace: slabs.
   function pick(raycaster) {
     const rec = shown && pres.building ? built.get(shown) : null;
     if (!rec) return null;
-    let targetsList;
-    if (pres.mode === 'floor') targetsList = rec.floors.get(pres.floor)?.hitMeshes || [];
-    else if (pres.mode === 'stack') targetsList = overviewOf(rec).flatMap(id => [rec.floors.get(id).slab, ...rec.floors.get(id).rooms].filter(Boolean));
-    else targetsList = [...rec.floors.values()].map(f => f.slab).filter(Boolean);
+    const mode = pres.mode;
+    const list = mode === 'floor' ? [rec.floors.get(pres.floor)].filter(Boolean)
+      : mode === 'stack' ? overviewOf(rec).map(id => rec.floors.get(id)) : [...rec.floors.values()];
     object.updateMatrixWorld(true);
-    const hit = raycaster.intersectObjects(targetsList, false)[0];
-    if (!hit) return null;
-    const u = hit.object.userData;
-    const base = { building: rec.id, floor: u.floorId, point: hit.point, distance: hit.distance, object: hit.object };
-    if (u.key) return { kind: 'room', key: u.key, cls: u.cls, space: u.space ?? null, ...base };
-    if (u.floorLayer) return { kind: 'floor', ...base };
-    return { kind: 'space', cls: u.wall ? 'wall' : u.cls, space: u.space ?? null, ...base };
+    let best = null;
+    const consider = (hit, f, piece) => { if (!best || hit.distance < best.hit.distance) best = { hit, f, piece }; };
+    for (const f of list) {
+      if (f.proxy) {
+        for (const hit of raycaster.intersectObject(f.proxy, false)) {
+          const piece = f.pieces[f.proxy.userData.pieces[hit.faceIndex]];
+          if (mode === 'inplace' ? !piece.slab : mode === 'stack' ? !piece.slab && !piece.key : false) continue;
+          consider(hit, f, piece);
+          break;
+        }
+      }
+      if (mode === 'floor' && f.meshes.walls) {
+        const hit = raycaster.intersectObject(f.meshes.walls, false)[0];
+        if (hit) consider(hit, f, null);
+      }
+    }
+    if (!best) return null;
+    const { hit, f, piece } = best;
+    const base = { building: rec.id, floor: f.id, point: hit.point, distance: hit.distance, object: hit.object };
+    if (!piece) return { kind: 'space', cls: 'wall', space: null, ...base };
+    if (piece.key) return { kind: 'room', key: piece.key, cls: piece.cls, space: piece.space ?? null, ...base };
+    if (piece.slab) return { kind: 'floor', ...base };
+    return { kind: 'space', cls: piece.cls, space: piece.space ?? null, ...base };
   }
 
-  // ---- room looks: status colour, hover / selection tint, emissive ----
-  const tmpColor = new THREE.Color(), accent = new THREE.Color();
-  function roomLook(mesh) {
-    const [top, side] = mesh.userData.kind ? STATUS[mesh.userData.kind] || STATUS.unknown : mesh.userData.base || STATUS.unknown;
-    const tint = mesh.userData.key === selectedKey ? SELECT_TINT : mesh.userData.key === hoverKey ? HOVER_TINT : 0;
+  // ---- room looks: status colour, hover / selection tint, emissive (all in vertex colours) ----
+  const topColor = new THREE.Color(), sideColor = new THREE.Color(), accent = new THREE.Color();
+  function roomLook(piece) {
+    const [top, side] = piece.kind ? STATUS[piece.kind] || STATUS.unknown : piece.base || STATUS.unknown;
+    const tint = piece.key === selectedKey ? SELECT_TINT : piece.key === hoverKey ? HOVER_TINT : 0;
     accent.setHex(COLORS.accent);
-    mesh.material[0].color.setHex(top);
-    mesh.material[1].color.setHex(side);
-    if (tint) { mesh.material[0].color.lerp(accent, tint); mesh.material[1].color.lerp(accent, tint); }
+    topColor.setHex(top); sideColor.setHex(side);
+    if (tint) { topColor.lerp(accent, tint); sideColor.lerp(accent, tint); }
+    paintRanges(piece.floor.meshes[piece.mesh].geometry.attributes.color, piece.ranges, topColor, sideColor);
   }
   function applyEmissive(rec) {
-    for (const f of rec.floors.values()) for (const { m } of f.mats) {
-      if (!m.isMeshStandardMaterial) continue;
-      if (emissiveK) m.emissive.copy(tmpColor.copy(m.color)).multiplyScalar(emissiveK);
-      else m.emissive.setHex(0);
-    }
+    for (const f of rec.floors.values()) for (const m of f.fills) m.emissive.setScalar(emissiveK);
   }
   function applyRoomLooks(rec) {
-    if (selectedKey || hoverKey) for (const f of rec.floors.values()) for (const mesh of f.rooms) if (mesh.userData.key === selectedKey || mesh.userData.key === hoverKey) roomLook(mesh);
+    for (const k of [selectedKey, hoverKey]) if (k) for (const piece of rec.roomIndex.get(k) || []) roomLook(piece);
     if (emissiveK) applyEmissive(rec);
   }
 
-  // Selection outline: the room's edges in the accent colour, just above its fill.
+  // Selection outline: the room's edges in the accent colour, just above its fill (one object per piece of
+  // the selected room).
   function refreshSelection() {
     if (selectOutline) { selectOutline.parent?.remove(selectOutline); disposeTree(selectOutline); selectOutline = null; }
     if (!selectedKey) return;
     const [b] = selectedKey.split('/');
     const rec = built.get(b);
-    const meshes = rec?.roomIndex.get(selectedKey);
-    if (!meshes) return;
+    const pieces = rec?.roomIndex.get(selectedKey);
+    if (!pieces) return;
     const g = new THREE.Group();
-    for (const mesh of meshes) {
+    for (const piece of pieces) {
       // Drawn over the low walls that stand on the room's edges.
       const mat = new THREE.LineBasicMaterial({ color: COLORS.accent, transparent: true, opacity: .9, depthWrite: false, depthTest: false });
       mat.fog = fog;
-      const line = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry, 25), mat);
-      line.position.y = mesh.position.y + .012;
+      const solid = extrudeUp(piece.shape, { depth: piece.depth, bevelEnabled: false, curveSegments: 2 });
+      const line = new THREE.LineSegments(new THREE.EdgesGeometry(solid, 25), mat);
+      solid.dispose();
+      line.position.y = piece.y + .012;
       line.renderOrder = 4 + RO;
       g.add(line);
     }
     selectOutline = g;
-    rec.floors.get(meshes[0].userData.floorId).group.add(g);
+    pieces[0].floor.group.add(g);
   }
 
   function restyle(rec) {
     for (const f of rec.floors.values()) {
-      for (const mesh of f.rooms) {
-        if (mesh.userData.cls !== 'classroom') continue;
-        const kind = roomStatus(occupancy, mesh.userData.key);
-        if (kind === mesh.userData.kind) continue;
-        mesh.userData.kind = kind;
-        roomLook(mesh);
+      for (const piece of f.pieces) {
+        if (!piece.key || piece.cls !== 'classroom') continue;
+        const kind = roomStatus(occupancy, piece.key);
+        if (kind === piece.kind) continue;
+        piece.kind = kind;
+        roomLook(piece);
       }
       for (const l of f.labels) if (l.key && l.status) l.kind = roomStatus(occupancy, l.key);
       f.stats = statsForFloor(rec.datas[f.id]?.features, rec.id, f.id, occupancy);
       updateBadge(f);
     }
-    if (emissiveK) applyEmissive(rec);
   }
 
   // Returns true when a building had to be rebuilt (the set of rooms changed), false for a recolour.
@@ -737,8 +784,7 @@ export function createIndoorLayer(options = {}) {
     for (const k of [old, key]) {
       if (!k) continue;
       const rec = built.get(k.split('/')[0]);
-      for (const mesh of rec?.roomIndex.get(k) || []) roomLook(mesh);
-      if (rec && emissiveK) applyEmissive(rec);
+      for (const piece of rec?.roomIndex.get(k) || []) roomLook(piece);
     }
     if (which === 'select') refreshSelection();
   }
@@ -765,6 +811,7 @@ export function createIndoorLayer(options = {}) {
     if (disposed) return;
     if (tween) { const t = tween; tween = null; t.resolve(false); }
     for (const id of [...built.keys()]) unload(id);
+    if (warm) { object.remove(warm); disposeTree(warm); warm = null; }
     disposed = true;
     object.removeFromParent();
   }

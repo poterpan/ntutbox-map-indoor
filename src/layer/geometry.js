@@ -4,7 +4,6 @@ import { classifyFeature, roomKey, roomStatus } from '../data/indoor.js';
 
 // Geometry of one floor: extruded spaces, low room walls, slab, outlines and label anchors.
 // Everything here is in the world frame (Y-up metres); a floor is built at y = 0 and the layer moves its group.
-// Stage 3 (merged geometry, vertex colours) replaces the inside of this module; its output shape stays.
 
 export const DEFAULT_PALETTE = {
   slabTop: 0xf8f8f7,
@@ -170,6 +169,87 @@ export function cleanWallOutline(ring) {
   return out;
 }
 
+// ---- merged floor geometry (stage 3, docs/LAYER.md「材質與效能」) ----
+// A floor is a handful of merged meshes instead of one mesh (and material pair) per space:
+//   base: slab, corridors, service spaces (no shadows)       cast: classrooms, places, stairs, toilets (cast shadows)
+//   walls: every low wall, built with its bottom at y = 0 (the layer grows it with mesh.scale.y)
+//   edges: room outlines                                       spaceEdges: focus-style boundaries (off by default)
+// Materials are per floor (floors fade independently), white × vertex colour; state colours (occupancy, hover,
+// selection) are written into the colour attribute. Picking uses one invisible flat proxy per floor (space top
+// faces + the slab) whose triangles map back to the space they came from.
+
+// Emissive follows the vertex colour, so `emissive = white × k` keeps "emissive = colour × k" per space.
+function emissiveFromVertexColour(shader) {
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <emissivemap_fragment>',
+    '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance *= vColor.rgb;',
+  );
+}
+export function fillMaterial({ roughness = .9, fog = true, transparent = true } = {}) {
+  const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness, metalness: 0, vertexColors: true, transparent });
+  m.fog = fog;
+  m.onBeforeCompile = emissiveFromVertexColour;
+  return m;
+}
+
+// Writes `top` / `side` (THREE.Color, working space) into a piece's ranges of a colour attribute and marks
+// just those ranges for upload.
+export function paintRanges(attr, ranges, top, side) {
+  const a = attr.array;
+  for (const r of ranges) {
+    const c = r.top ? top : side;
+    const e = (r.start + r.count) * 3;
+    for (let i = r.start * 3; i < e; i += 3) { a[i] = c.r; a[i + 1] = c.g; a[i + 2] = c.b; }
+    attr.addUpdateRange(r.start * 3, r.count * 3);
+  }
+  attr.needsUpdate = true;
+}
+
+// Concatenates parts ({ geom, top, side, piece? }) into one non-indexed geometry with position, normal and
+// colour. An extrusion's group 0 (its caps) is painted `top`, the rest `side`; piece.ranges records where the
+// part landed (in vertices). The part geometries are disposed.
+function mergeParts(parts) {
+  const geoms = parts.map(p => {
+    const g = p.geom.index ? p.geom.toNonIndexed() : p.geom;
+    if (g !== p.geom) p.geom.dispose();
+    return g;
+  });
+  const n = geoms.reduce((s, g) => s + g.attributes.position.count, 0);
+  const pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  const color = new THREE.BufferAttribute(col, 3);
+  const top = new THREE.Color(), side = new THREE.Color();
+  let at = 0;
+  parts.forEach((p, i) => {
+    const g = geoms[i], count = g.attributes.position.count;
+    pos.set(g.attributes.position.array, at * 3);
+    nor.set(g.attributes.normal.array, at * 3);
+    const groups = g.groups.length ? g.groups : [{ start: 0, count, materialIndex: 1 }];
+    const ranges = groups.map(gr => ({ start: at + gr.start, count: Math.min(gr.count, count - gr.start), top: gr.materialIndex === 0 }));
+    paintRanges(color, ranges, top.setHex(p.top), side.setHex(p.side));
+    if (p.piece) p.piece.ranges = ranges;
+    at += count;
+    g.dispose();
+  });
+  color.clearUpdateRanges();
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  geom.setAttribute('color', color);
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+  return geom;
+}
+
+function mergeLines(geoms) {
+  const n = geoms.reduce((s, g) => s + g.attributes.position.count, 0);
+  const pos = new Float32Array(n * 3);
+  let at = 0;
+  for (const g of geoms) { pos.set(g.attributes.position.array, at); at += g.attributes.position.count * 3; g.dispose(); }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  return geom;
+}
+
 // Builds one floor into a fresh group at y = 0. Returns the floor record the layer animates.
 //   ctx: { buildingId, floorId, index, features, occupancy, project, palette, fog, receiveShadow,
 //          footprintFeature, footprintM, classify?, spaceOf?, labelFor? }
@@ -177,6 +257,9 @@ export function cleanWallOutline(ring) {
 //   classify(p) → space class ('room' = a named place: raised fill + edges in the `place` colour, no low walls);
 //   spaceOf(feature) → { key, selectable, … } (SpaceInfo); selectable spaces get a key, tint and outline;
 //   labelFor(info, cls) → { text, priority?, kind?, fadeIn? } | null, replacing the default labels.
+// floor.pieces: one entry per drawn polygon { feature, cls, kind?, base?, key, space, slab?, mesh: 'base'|'cast',
+// ranges, box (floor-local), shape, depth, y }; floor.meshes: { base, cast, walls, edges, spaceEdges } (absent
+// when empty); floor.proxy: the pick proxy (userData.pieces: triangle → index into floor.pieces).
 export function buildFloor(ctx) {
   const { floorId: id, features, occupancy, project, palette: COLORS, fog, receiveShadow } = ctx;
   const spaceOf = ctx.spaceOf || (() => null);
@@ -184,9 +267,9 @@ export function buildFloor(ctx) {
   const group = new THREE.Group();
   group.userData.floorId = id;
   const floor = {
-    id, index: ctx.index, group, slab: null, hull: null,
-    rooms: [], hitMeshes: [], drawables: [], walls: [], wallScale: null, labels: [], mats: [], casters: [], spaceEdges: [],
-    fade: 0, fadeTarget: 0, outline: null, outlineFade: 0, outlineTarget: 0, focusEdge: null, focusStyleK: undefined,
+    id, index: ctx.index, group, hull: null, outlinePoints: null,
+    pieces: [], meshes: {}, proxy: null, drawables: [], casters: [], labels: [], mats: [], fills: [], spaceEdges: [],
+    wallScale: null, fade: 0, fadeTarget: 0, outline: null, outlineFade: 0, outlineTarget: 0, focusEdge: null, focusStyleK: undefined,
     localBox: null, badge: null,
   };
   const classify = ctx.classify || (p => classifyFeature(p, occupancy));
@@ -198,6 +281,7 @@ export function buildFloor(ctx) {
     return cls === 'classroom' ? roomKey(feature.properties) : null;
   };
   const lineMat = params => { const m = new THREE.LineBasicMaterial(params); m.fog = fog; return m; };
+  const parts = { base: [], cast: [] }, wallGeoms = [], edgeGeoms = [], spaceEdgeGeoms = [];
 
   // Walls already built on this floor, as collinear intervals. Adjacent rooms share boundaries, so without
   // this every shared edge would get two overlapping walls.
@@ -206,15 +290,10 @@ export function buildFloor(ctx) {
     const dx = x2 - x1, dz = z2 - z1;
     const len = Math.hypot(dx, dz);
     if (len < .08) return;
-    const geom = new THREE.BoxGeometry(len, WALL.height, WALL.thickness);
-    const mat = new THREE.MeshStandardMaterial({ color: COLORS.wallSide, roughness: .95, metalness: 0 });
-    mat.fog = fog;
-    const mesh = new THREE.Mesh(geom, mat);
-    mesh.position.set((x1 + x2) / 2, WALL.base + WALL.height / 2, (z1 + z2) / 2);
-    mesh.rotation.y = -Math.atan2(dz, dx);
-    mesh.receiveShadow = receiveShadow;
-    mesh.userData = { wall: true, caster: true, floorId: id };
-    group.add(mesh);
+    // Bottom at y = 0; the merged wall mesh sits at WALL.base and grows with scale.y.
+    const geom = new THREE.BoxGeometry(len, WALL.height, WALL.thickness)
+      .translate(0, WALL.height / 2, 0).rotateY(-Math.atan2(dz, dx)).translate((x1 + x2) / 2, 0, (z1 + z2) / 2);
+    wallGeoms.push({ geom, top: COLORS.wallSide, side: COLORS.wallSide });
   };
   // Plan coordinates (x, north) in; walls are placed at world (x, −north).
   const addDedupedWall = (ax, ay, bx, by) => {
@@ -251,16 +330,14 @@ export function buildFloor(ctx) {
 
   const styleFor = (p, cls) => {
     if (cls === 'classroom') {
-      // Each room keeps its own material pair, so a status change only recolours it.
       const kind = roomStatus(occupancy, roomKey(p));
-      return { depth: .07, y: .10, mats: materialPair(...STATUS[kind], { fog }), kind };
+      return { depth: .07, y: .10, colors: STATUS[kind], kind };
     }
-    if (cls === 'room') return { depth: .07, y: .10, mats: materialPair(COLORS.place, COLORS.placeSide, { fog }), base: [COLORS.place, COLORS.placeSide] };
-    if (cls === 'corridor') return { depth: .035, y: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide, { fog }), base: [COLORS.corridor, COLORS.corridorSide] };
-    if (cls === 'vertical') return { depth: .12, y: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide, { fog }), base: [COLORS.vertical, COLORS.verticalSide] };
-    if (cls === 'restroom') return { depth: .10, y: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide, { fog }), base: [COLORS.restroom, COLORS.restroomSide] };
-    // Opaque: a semi-transparent space would let the faint neighbour floors bleed through the focused floor.
-    if (cls === 'service') return { depth: .065, y: .08, mats: materialPair(COLORS.service, COLORS.serviceSide, { fog }), base: [COLORS.service, COLORS.serviceSide] };
+    if (cls === 'room') return { depth: .07, y: .10, colors: [COLORS.place, COLORS.placeSide] };
+    if (cls === 'corridor') return { depth: .035, y: .08, colors: [COLORS.corridor, COLORS.corridorSide] };
+    if (cls === 'vertical') return { depth: .12, y: .09, colors: [COLORS.vertical, COLORS.verticalSide] };
+    if (cls === 'restroom') return { depth: .10, y: .09, colors: [COLORS.restroom, COLORS.restroomSide] };
+    if (cls === 'service') return { depth: .065, y: .08, colors: [COLORS.service, COLORS.serviceSide] };
     return null;
   };
 
@@ -312,41 +389,26 @@ export function buildFloor(ctx) {
     const style = styleFor(feature.properties, cls);
     if (!style) return;
     const key = keyOf(feature, cls);
+    const caster = isRoomCls(cls) || cls === 'vertical' || cls === 'restroom';
+    const info = spaceOf(feature);
     for (const rings of ringsFromGeometry(feature.geometry)) {
       const shape = shapeFromRings(rings, project);
       if (!shape) continue;
-      const geom = extrudeUp(shape, {
-        depth: style.depth,
-        bevelEnabled: false,
-        bevelSize: isRoomCls(cls) ? .04 : .02,
-        bevelThickness: isRoomCls(cls) ? .03 : .015,
-        bevelSegments: 1,
-        curveSegments: 2,
-      });
-      const mesh = new THREE.Mesh(geom, style.mats);
-      mesh.position.y = style.y + 0;
-      mesh.receiveShadow = receiveShadow;
-      mesh.userData = {
-        feature, cls, kind: style.kind, floorId: id, key,
-        caster: isRoomCls(cls) || cls === 'vertical' || cls === 'restroom',
+      const geom = extrudeUp(shape, { depth: style.depth, bevelEnabled: false, curveSegments: 2 }).translate(0, style.y, 0);
+      geom.computeBoundingBox();
+      const piece = {
+        feature, cls, kind: style.kind, base: style.kind ? undefined : style.colors, key, space: info || null,
+        mesh: caster ? 'cast' : 'base', ranges: null, box: geom.boundingBox.clone(), shape, depth: style.depth, y: style.y,
       };
-      if (style.base) mesh.userData.base = style.base;
-      const info = spaceOf(feature);
-      if (info) mesh.userData.space = info;
-      group.add(mesh);
-      if (key) floor.rooms.push(mesh);
+      floor.pieces.push(piece);
+      parts[piece.mesh].push({ geom, top: style.colors[0], side: style.colors[1], piece });
       if (isRoomCls(cls)) {
-        const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 25), lineMat({ color: COLORS.outline, transparent: true, opacity: .24 }));
-        edge.position.y = style.y + 0 + .006;
-        group.add(edge);
-        // Low walls only around classrooms: hosts may mark hundreds of places as 'room' (one draw call per wall).
+        edgeGeoms.push(new THREE.EdgesGeometry(geom, 25).translate(0, .006, 0));
+        // Low walls only around classrooms: hosts may mark hundreds of places as 'room'.
         if (cls === 'classroom') addRoomLowWalls(feature);
       } else if (cls === 'service' || cls === 'vertical' || cls === 'restroom') {
         // Plan-style boundaries between the many neutral spaces; only drawn on the focused floor.
-        const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geom, 25), lineMat({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }));
-        edge.position.y = style.y + 0 + .006;
-        edge.userData.focusStyle = 'space';
-        group.add(edge);
+        spaceEdgeGeoms.push(new THREE.EdgesGeometry(geom, 25).translate(0, .006, 0));
       }
     }
     addFeatureLabels(feature, cls, key);
@@ -356,26 +418,54 @@ export function buildFloor(ctx) {
   // buildings' footprints do not match their floors (AM basements are much larger), so those floors fall
   // back to the convex hull of their own spaces.
   floor.hull = slabOutline(features, ctx.footprintM, classify, project);
-  floor.slab = addSlab(group, floor.hull, ctx.footprintFeature, project, COLORS, fog, receiveShadow, id);
+  const slab = slabPiece(floor.hull, ctx.footprintFeature, project);
+  if (slab) {
+    floor.outlinePoints = slab.outlinePoints;
+    floor.pieces.push(slab.piece);
+    parts.base.push({ geom: slab.geom, top: COLORS.slabTop, side: COLORS.slabSide, piece: slab.piece });
+  }
 
   const order = { corridor: 0, service: 1, vertical: 2, restroom: 3, classroom: 4, room: 4, void: 8, skip: 9 };
   features.slice().sort((a, b) => order[classify(a.properties)] - order[classify(b.properties)]).forEach(addFeature);
 
-  group.traverse(n => {
-    if (!n.isMesh && !n.isLineSegments) return;
-    floor.drawables.push(n);
-    if (n.userData.focusStyle === 'space') { floor.spaceEdges.push(n); return; }
-    if (n.isMesh) {
-      floor.hitMeshes.push(n);
-      if (n.userData.wall) floor.walls.push(n);
-      if (n.userData.caster) floor.casters.push(n);
-    }
-    // Always transparent so a floor can fade without a shader recompile.
-    for (const m of [].concat(n.material)) { m.transparent = true; floor.mats.push({ m, base: m.opacity }); }
-  });
+  // Merged meshes, in draw order. Materials start transparent (a floor fades without a recompile); the layer
+  // switches fills to opaque at rest where the host allows it.
+  const addMesh = (name, geom, mat, { fill = false, caster = false } = {}) => {
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.receiveShadow = receiveShadow;
+    mesh.userData = { floorId: id, part: name };
+    group.add(mesh);
+    floor.meshes[name] = mesh;
+    floor.drawables.push(mesh);
+    floor.mats.push({ m: mat, base: mat.opacity });
+    if (fill) floor.fills.push(mat);
+    if (caster) floor.casters.push(mesh);
+    return mesh;
+  };
+  if (parts.base.length) addMesh('base', mergeParts(parts.base), fillMaterial({ fog }), { fill: true });
+  if (parts.cast.length) addMesh('cast', mergeParts(parts.cast), fillMaterial({ fog }), { fill: true, caster: true });
+  if (wallGeoms.length) {
+    const walls = addMesh('walls', mergeParts(wallGeoms), fillMaterial({ roughness: .95, fog }), { fill: true, caster: true });
+    walls.position.y = WALL.base;
+    walls.userData.wall = true;
+  }
+  const addLines = (name, geoms, params) => {
+    const line = new THREE.LineSegments(mergeLines(geoms), lineMat(params));
+    line.userData = { floorId: id, part: name };
+    group.add(line);
+    floor.meshes[name] = line;
+    floor.drawables.push(line);
+    floor.mats.push({ m: line.material, base: line.material.opacity });
+    return line;
+  };
+  if (edgeGeoms.length) addLines('edges', edgeGeoms, { color: COLORS.outline, transparent: true, opacity: .24 });
+  if (spaceEdgeGeoms.length) floor.spaceEdges.push(addLines('spaceEdges', spaceEdgeGeoms, { color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }));
+
+  floor.proxy = pickProxy(floor);
+  if (floor.proxy) group.add(floor.proxy);
 
   // Outline-only ghost, kept outside the floor group so it can show while the fill is hidden.
-  const outlinePts = floor.slab?.userData.outlinePoints;
+  const outlinePts = floor.outlinePoints;
   if (outlinePts?.length) {
     const line = new THREE.LineLoop(
       new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .08, -p.y))),
@@ -400,6 +490,56 @@ export function buildFloor(ctx) {
   return floor;
 }
 
+// Flat pick proxy: the top faces of every space and the whole slab, in the order of floor.pieces' meshes;
+// userData.pieces maps each triangle to its piece. Never drawn (raycasting ignores visibility).
+function pickProxy(floor) {
+  const tris = [];
+  let n = 0;
+  for (const name of ['base', 'cast']) {
+    const mesh = floor.meshes[name];
+    if (!mesh) continue;
+    const pos = mesh.geometry.attributes.position.array, nor = mesh.geometry.attributes.normal.array;
+    floor.pieces.forEach((piece, index) => {
+      if (piece.mesh !== name) return;
+      for (const r of piece.ranges) {
+        if (!piece.slab && !r.top) continue;
+        for (let v = r.start; v + 2 < r.start + r.count; v += 3) {
+          if (!piece.slab && nor[v * 3 + 1] < .5) continue; // a space's bottom cap
+          tris.push(pos.subarray(v * 3, v * 3 + 9), index);
+          n++;
+        }
+      }
+    });
+  }
+  if (!n) return null;
+  const pos = new Float32Array(n * 9), map = new Int32Array(n);
+  for (let i = 0; i < n; i++) { pos.set(tris[i * 2], i * 9); map[i] = tris[i * 2 + 1]; }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial());
+  mesh.visible = false;
+  mesh.userData = { floorId: floor.id, proxy: true, pieces: map };
+  return mesh;
+}
+
+function slabPiece(hull, footprintFeature, project) {
+  let shape = null;
+  if (hull) shape = shapeFromPoints(hull);
+  else if (footprintFeature) {
+    for (const rings of ringsFromGeometry(footprintFeature.geometry)) {
+      const s = shapeFromRings(rings, project);
+      if (s) { shape = s; break; }
+    }
+  }
+  if (!shape) return null;
+  const geom = extrudeUp(shape, { depth: SLAB_DEPTH, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 })
+    .translate(0, .06 - SLAB_DEPTH, 0);
+  geom.computeBoundingBox();
+  return { geom, outlinePoints: shape.getPoints(), piece: { slab: true, mesh: 'base', ranges: null, box: geom.boundingBox.clone() } };
+}
+
 function slabOutline(features, footprintM, classify, project) {
   const fb = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity };
   footprintM.forEach(([x, z]) => { fb.minX = Math.min(fb.minX, x); fb.maxX = Math.max(fb.maxX, x); fb.minZ = Math.min(fb.minZ, z); fb.maxZ = Math.max(fb.maxZ, z); });
@@ -412,24 +552,4 @@ function slabOutline(features, footprintM, classify, project) {
   const inside = pts.every(([x, z]) => x >= fb.minX - tol && x <= fb.maxX + tol && z >= fb.minZ - tol && z <= fb.maxZ + tol);
   // Hull taken in the plan (x, north) so its winding and start vertex match the slab shape's frame.
   return inside ? null : convexHull(pts.map(([x, z]) => [x, -z])).map(([x, n]) => [x, -n]);
-}
-
-function addSlab(group, hull, footprintFeature, project, COLORS, fog, receiveShadow, floorId) {
-  let shape = null;
-  if (hull) shape = shapeFromPoints(hull);
-  else if (footprintFeature) {
-    for (const rings of ringsFromGeometry(footprintFeature.geometry)) {
-      const s = shapeFromRings(rings, project);
-      if (s) { shape = s; break; }
-    }
-  }
-  if (!shape) return null;
-  const depth = SLAB_DEPTH;
-  const geom = extrudeUp(shape, { depth, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 });
-  const mesh = new THREE.Mesh(geom, materialPair(COLORS.slabTop, COLORS.slabSide, { fog }));
-  mesh.position.y = .06 - depth;
-  mesh.receiveShadow = receiveShadow;
-  mesh.userData = { floorLayer: true, floorId, outlinePoints: shape.getPoints() };
-  group.add(mesh);
-  return mesh;
 }
