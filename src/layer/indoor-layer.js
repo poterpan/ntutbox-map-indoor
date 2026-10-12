@@ -48,6 +48,7 @@ export function createIndoorLayer(options = {}) {
     spaceLabel: null,
     spaceClass: null,
     badgeAnchor: 'middle',
+    hoverStyle: null,
     ...options,
   };
   const GROUPING = typeof opts.stackFloors === 'function' ? opts.stackFloors : null;
@@ -67,6 +68,10 @@ export function createIndoorLayer(options = {}) {
   const receiveShadows = opts.shadows?.receive ?? true;
   const fog = !!opts.fog;
   const RO = opts.renderOrderBase || 0;
+  // Stack hover emphasis (host hook; null = the course site's look): other floors' fill, an accent outline on
+  // the hovered floor, a lift (fraction of stackGap) and a ' hover' badge kind.
+  const HS = opts.hoverStyle || null;
+  const HOVER_FADE = HS?.fade ?? STYLE.hoverFade;
   // Fills go opaque at rest (stack overview, fully shown): no blending, early depth rejection. A host that sets
   // renderOrderBase draws the floors after its own transparent objects, an order that only exists in the
   // transparent pass, so its floors stay transparent.
@@ -333,7 +338,7 @@ export function createIndoorLayer(options = {}) {
       f.badge.hidden = text == null;
       f.badge.text = text == null ? '' : String(text);
     } else f.badge.text = group ? f.entry.label : `${f.id} · ${f.stats.available}/${f.stats.total} 沒排課`;
-    f.badge.kind = badgeKind(f.stats) + (group ? ' collapsed' : '');
+    f.badge.kind = f.badge.baseKind = badgeKind(f.stats) + (group ? ' collapsed' : '');
     f.badge.floors = group || undefined;
     f.badge.stats = f.stats;
   }
@@ -481,7 +486,7 @@ export function createIndoorLayer(options = {}) {
     const flying = !!tween;
     for (const f of rec.floors.values()) {
       let t = 0, o = 0;
-      if (mode === 'stack' || mode === 'leave') t = overview.has(f.id) ? (mode === 'stack' && hoverFloor && hoverFloor !== f.id ? STYLE.hoverFade : 1) * windowVis(rec, f.id) : 0;
+      if (mode === 'stack' || mode === 'leave') t = overview.has(f.id) ? (mode === 'stack' && hoverFloor && hoverFloor !== f.id ? HOVER_FADE : 1) * windowVis(rec, f.id) : 0;
       else if (mode === 'inplace') { t = STYLE.inplaceFill; o = STYLE.inplaceOutline; }
       const neighbour = !!focus && Math.abs(f.index - focus.index) === 1;
       if (focus) t = f === focus ? 1 : neighbour && flying ? STYLE.neighborFade : 0;
@@ -493,7 +498,10 @@ export function createIndoorLayer(options = {}) {
       f.casters.forEach(m => { m.castShadow = castShadows && cast; });
       // The focused floor draws last, over the faint neighbours (which do not write depth), so a
       // neighbour only shows where the focused floor is not: context without muddying the map.
-      const order = (cast ? 2 : 1) + RO;
+      // hoverStyle: the hovered stack floor draws after the faded ones (which do not write depth), so it reads
+      // fully opaque even where faint upper floors lie over it.
+      const lifted = !!HS && mode === 'stack' && hoverFloor === f.id;
+      const order = (cast || lifted ? 2 : 1) + RO;
       f.drawables.forEach(n => { n.renderOrder = order; });
       if (f.outline) f.outline.renderOrder = 1 + RO;
       if (f.focusEdge) f.focusEdge.renderOrder = 3 + RO;
@@ -504,7 +512,8 @@ export function createIndoorLayer(options = {}) {
     const rec = shown ? built.get(shown) : null;
     if (!rec) return;
     for (const f of rec.floors.values()) {
-      f.group.position.y = f.y;
+      const lift = HS?.lift && f.hoverK ? HS.lift * pres.stackGap * f.hoverK : 0;
+      f.group.position.y = f.y + lift;
       if (f.outline) f.outline.position.y = f.y;
     }
   }
@@ -582,9 +591,37 @@ export function createIndoorLayer(options = {}) {
     }
   }
 
+  // Hover emphasis (hoverStyle): eases each floor's hover weight, which drives the lift and the accent outline.
+  function updateHover(dt) {
+    const rec = shown ? built.get(shown) : null;
+    if (!rec || !HS) return false;
+    let moving = false;
+    for (const f of rec.floors.values()) {
+      const target = pres.building === rec.id && pres.mode === 'stack' && !tween && hoverFloor === f.id ? 1 : 0;
+      const cur = f.hoverK || 0;
+      if (cur === target && !(f.hoverEdge && f.hoverEdge.visible !== target > 0)) continue;
+      let k = cur + (target - cur) * Math.min(1, dt * 12);
+      if (Math.abs(k - target) < .01) k = target;
+      f.hoverK = k;
+      if (k !== target) moving = true;
+      if (HS.outline !== false && f.outlinePoints?.length) {
+        if (!f.hoverEdge && k > 0) {
+          const mat = new THREE.LineBasicMaterial({ color: COLORS.accent, transparent: true, opacity: 0, depthWrite: false });
+          mat.fog = fog;
+          f.hoverEdge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(f.outlinePoints.map(p => new THREE.Vector3(p.x, .22, -p.y))), mat);
+          f.hoverEdge.renderOrder = 4 + RO;
+          f.group.add(f.hoverEdge);
+        }
+        if (f.hoverEdge) { const o = .95 * k * windowVis(rec, f.id); f.hoverEdge.material.opacity = o; f.hoverEdge.visible = o > .01; }
+      }
+    }
+    return moving;
+  }
+
   function update(dt) {
     if (disposed) return false;
     let moving = false;
+    if (updateHover(dt)) moving = true;
     const rec = shown ? built.get(shown) : null;
     if (tween && rec) {
       tween.t += dt * 1000;
@@ -722,6 +759,7 @@ export function createIndoorLayer(options = {}) {
       } else {
         worldTmp.y += rec.floors.get(l.floor).group.position.y;
         l.opacity = l.role === 'badge' ? (l.hidden ? 0 : stackOpacity * (win ? rec.stackVis?.get(l.floor) ?? 0 : 1)) : floorMode && l.floor === pres.floor ? arrive : 0;
+        if (HS && l.role === 'badge' && l.baseKind) l.kind = l.baseKind + (hoverFloor === l.floor && pres.mode === 'stack' ? ' hover' : '');
       }
       l.position.copy(worldTmp).applyMatrix4(m);
     }

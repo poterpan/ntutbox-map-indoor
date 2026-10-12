@@ -118,6 +118,8 @@ createIndoorLayer({
   spaceLabel?: (space: SpaceInfo) => { text, priority?, kind?, fadeIn? } | null,  // 取代預設標籤（正門除外），每個 key 一個
   spaceClass?: (space: SpaceInfo) => SpaceClass | null,  // 改畫法；'room'＝具名地點：place 色、教室高度、邊線（不加矮牆）
   badgeAnchor?: 'middle' | 'near',             // 透視宿主用 near：徽章在總覽靠相機那側，不壓到下面的樓層
+  hoverStyle?: { fade?, outline?, lift? },     // 整棟 hover 強調：其他層淡到 fade、該層 accent 外框＋浮起 lift×stackGap、
+                                               // 畫在淡化層之後（完整不透明）、徽章 kind 加 ' hover'。null＝排課站原樣（其他層 .28）
 })
 layer.space(key): SpaceInfo | null             // 已載入棟的任何空間（能不能選都有）
 layer.spaces(buildingId): SpaceInfo[]          // 一個 key 一筆；之後給搜尋用
@@ -134,7 +136,7 @@ layer.spaces(buildingId): SpaceInfo[]          // 一個 key 一筆；之後給�
 
 ## 高樓：收合與視窗（0.12 第三輪，2026-10-12）
 
-AM（先鋒 21 層）這種高樓整棟擠不下：徽章疊在一起、手機上每層只剩一條線。兩個通用機制，預設都不開（排課站不變）：
+AM（先鋒 21 層）這種高樓整棟擠不下：徽章疊在一起、手機上每層只剩一條線。兩個通用機制，預設都不開（排課站不變），可以分開用：
 
 ```ts
 type StackGrouping = (floors: StackFloorInfo[], buildingId) => Array<string | string[]>;
@@ -146,7 +148,8 @@ layer.stackEntries(id): StackEntry[]   // { id（畫出來的那層）, floors, 
 - **收合**：分組函式回傳的陣列是一格（單獨一層也可以），畫它離地面最近的那層（R1–R3 畫 R1、B4–B2 畫 B2），只佔半格高；
   徽章字預設 `R1–R3`（`badgeText` 會收到 `floors`），kind 加 ` collapsed`。其他成員藏在它旁邊（換層時從那裡長出來）。
   函式沒列到的樓層不顯示（沒有跳層標記）；結果不合法（順序錯、不認得的樓層）就退回每層一格並 console.error。
-  「哪些樓層算沒東西」是宿主的語意（map 用 placePolicy 的「有沒有可選地點」），套件不判斷。
+  「哪些樓層算沒東西」是宿主的語意，套件不判斷。收合是「找空教室」的語意（排課站那種「xF–yF 沒有教室」）；
+  map.ntutbox.com 找路**不收合**、每層一格（使用者 2026-10-12），只用視窗。
 - **視窗**：`stackFloors` 是 `'all'` 或函式時可用（`'classrooms'` 忽略）。視窗最下面那格永遠放在第一格的位置，所以
   捲動時相機不用動：樓層滑過一個固定的框，視窗外的淡出、不能點；`buildingBox` 只算視窗內。小數的 start 讓邊緣兩格半透明（拖曳）。
   標籤多兩個「下面還有 N 層」／「上面還有 N 層」（role `badge`、kind `more`、`more: 'below' | 'above'`、沒有 floor；N 是樓層數不是格數），

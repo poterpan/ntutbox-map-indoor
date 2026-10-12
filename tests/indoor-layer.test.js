@@ -494,3 +494,37 @@ test('stack window: only the window shows, its bottom entry at the base; hints c
   plain.dispose();
   layer.dispose();
 });
+
+test('hoverStyle: hovered stack floor lifts with an accent outline and a hover badge; others fade further', async () => {
+  const layer = make({ stackFloors: 'all', hoverStyle: { fade: .12, lift: .1 } });
+  await layer.load('TB');
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10 });
+  run(layer, .2);
+  const y0 = layer.floorBox('TB', '2F').min.y;
+  let g2 = null; layer.object.traverse(o => { if (o.userData?.floorId === '2F' && o.isGroup) g2 = o; });
+  const base = g2.position.y;
+  layer.setHoveredFloor('2F');
+  assert.equal(layer.update(1 / 60), true, 'animates');
+  run(layer, .5);
+  close(g2.position.y - base, 1, 'lift = .1 × stackGap');
+  close(layer.floorBox('TB', '2F').min.y, y0, 'boxes stay on the layout (no camera churn)');
+  const edge = g2.children.find(o => o.isLineLoop && o.material.color.getHex() === DEFAULT_PALETTE.accent);
+  assert.ok(edge?.visible && edge.material.opacity > .9);
+  const labels = layer.labels();
+  assert.match(labels.find(l => l.id === 'badge:TB/2F').kind, / hover$/);
+  assert.doesNotMatch(labels.find(l => l.id === 'badge:TB/1F').kind, /hover/);
+  let m1 = null; layer.object.traverse(o => { if (o.userData?.floorId === '1F' && o.userData.part === 'base') m1 = o.material; });
+  close(m1.opacity, .12, 'other floors at hoverStyle.fade', .01);
+  layer.setHoveredFloor(null);
+  run(layer, .5);
+  close(g2.position.y, base);
+  assert.equal(edge.visible, false);
+  layer.dispose();
+  // Default: classic hover (no outline, no lift, .28).
+  const plain = make({ stackFloors: 'all' });
+  await plain.load('TB');
+  await plain.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10 });
+  plain.setHoveredFloor('2F'); run(plain, .5);
+  assert.equal(plain.labels().find(l => l.id === 'badge:TB/2F').kind, 'full');
+  plain.dispose();
+});

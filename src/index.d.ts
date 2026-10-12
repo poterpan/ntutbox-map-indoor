@@ -388,6 +388,10 @@ export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
   badgeAnchor?: 'middle' | 'near';
   /** Override how a space is drawn; return null to keep the default class. 'room' = drawn like a room in the place colour. */
   spaceClass?: (space: SpaceInfo) => SpaceClass | null;
+  /** Stack hover emphasis (setHoveredFloor). Default null = the classic look (other floors .28, nothing else).
+   *  fade: other floors' fill; outline: accent outline on the hovered floor (default true); lift: rise as a
+   *  fraction of stackGap; the hovered floor's badge kind gets ' hover'. */
+  hoverStyle?: { fade?: number; outline?: boolean; lift?: number } | null;
 }
 
 export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
