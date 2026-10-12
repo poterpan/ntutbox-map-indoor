@@ -430,6 +430,8 @@ export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
   elevation(buildingId: string, floorId: string): number | null;
   /** Ground points [x, z] of what the stack shows (footprint + overview floor hulls), to derive a stack gap. */
   outlinePoints(buildingId: string): [number, number][];
+  /** Ground outline [x, z] of one floor's slab, in the layer frame ([] when unknown). Add the floor's current y yourself. */
+  floorOutline(buildingId: string, floorId: string): [number, number][];
   /** The stack overview's entries, bottom to top ([] when not loaded). */
   stackEntries(buildingId: string): StackEntry[];
   room(key: string): RoomInfo<O> | null;

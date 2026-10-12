@@ -89,6 +89,7 @@ interface IndoorLayer {
   floors(id): FloorStats[];
   elevation(id, floorId): number | null;
   outlinePoints(id): [x, z][];              // 總覽顯示的地面點（外框＋超出外框樓層的凸包）
+  floorOutline(id, floorId): [x, z][];      // 某層樓板外框（宿主用自己的相機把標籤貼在那層的可見邊緣；y 用標籤的 position.y）
   room(key): RoomInfo | null;
   labels(): readonly IndoorLabel[];         // {id 穩定, position 世界座標, text, role, kind, priority, opacity, key?, floor?}
   dispose(): void;

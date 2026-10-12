@@ -703,6 +703,13 @@ export function createIndoorLayer(options = {}) {
       occupancy: occupancy?.get(key) || null,
     };
   }
+  // Ground outline [x, z] of one floor's slab (footprint, or the hull of a floor that does not fit it). Hosts
+  // use it to glue labels to a floor's visible edge under their own camera.
+  function floorOutline(id, floorId) {
+    const f = built.get(id)?.floors.get(floorId);
+    return f?.outlinePoints ? f.outlinePoints.map(p => [p.x, -p.y]) : [];
+  }
+
   // Floors (not entries) outside a stack window, below or above it.
   function moreFloors(rec, win, side) {
     const i0 = Math.round(win.start), i1 = i0 + win.size;
@@ -954,6 +961,7 @@ export function createIndoorLayer(options = {}) {
     elevation,
     outlinePoints,
     stackEntries,
+    floorOutline,
     room,
     space,
     spaces,

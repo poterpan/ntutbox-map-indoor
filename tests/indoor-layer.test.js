@@ -528,3 +528,14 @@ test('hoverStyle: hovered stack floor lifts with an accent outline and a hover b
   assert.equal(plain.labels().find(l => l.id === 'badge:TB/2F').kind, 'full');
   plain.dispose();
 });
+
+test('floorOutline: the slab outline of a floor in the layer frame', async () => {
+  const layer = make();
+  await layer.load('TB');
+  const pts = layer.floorOutline('TB', '1F');
+  assert.ok(pts.length >= 4);
+  const xs = pts.map(p => p[0]), zs = pts.map(p => p[1]);
+  near(Math.min(...xs), 0); near(Math.max(...xs), 40); near(Math.min(...zs), -20); near(Math.max(...zs), 0);
+  assert.deepEqual(layer.floorOutline('TB', 'XX'), []);
+  layer.dispose();
+});
