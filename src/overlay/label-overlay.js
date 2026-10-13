@@ -70,10 +70,8 @@ export function createLabelOverlay(container, options = {}) {
   function sync(labels) {
     if (disposed) return;
     let changed = labels.length !== order.length;
-    const seen = new Set();
     for (let i = 0; i < labels.length; i++) {
       const l = labels[i];
-      seen.add(l.id);
       let st = states.get(l.id);
       if (!st) { st = create(l); changed = true; }
       else if (!changed && order[i] !== l.id) changed = true;
@@ -82,7 +80,8 @@ export function createLabelOverlay(container, options = {}) {
       if (cls !== st.cls) { st.el.className = cls; st.cls = cls; st.w = 0; }
       if (l.text !== st.text) { st.el.textContent = l.text; st.text = l.text; st.w = 0; }
     }
-    if (!changed) return;
+    if (!changed) return; // the common case (nothing appeared or vanished) allocates nothing
+    const seen = new Set(labels.map(l => l.id));
     for (const [id, st] of states) if (!seen.has(id)) { st.el.remove(); states.delete(id); }
     // Document order = list order (later labels paint on top), after whatever else the container holds.
     for (const l of labels) container.appendChild(states.get(l.id).el);

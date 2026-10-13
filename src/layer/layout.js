@@ -77,6 +77,15 @@ function squeezeHidden(floors, ids, y, gap) {
   }
 }
 
+// Progressive spacing s + bend·s²/2, continued linearly beyond |s| = .75/|bend| (where the slope would drop below
+// .25 and, further out, fold back: floors far outside a window must stay in order for the accordion transition).
+export function bent(s, bend) {
+  if (!bend) return s;
+  const lim = .75 / Math.abs(bend);
+  const q = Math.max(-lim, Math.min(lim, s));
+  return q + bend * q * q / 2 + (s - q) * (1 + bend * q);
+}
+
 // Clamps a stack window to n entries: { start (entry index, fractional while dragging), size }.
 export function clampWindow(win, n) {
   if (!win || !n) return null;
@@ -109,8 +118,7 @@ export function entryLayout(floors, { gap, baseY = 0, entries, collapsedSlot = C
   }
   const y = new Map();
   entries.forEach((e, i) => {
-    const sl = slots[i] - offset;
-    y.set(e.id, (sl + bend * sl * sl / 2) * gap + baseY);
+    y.set(e.id, bent(slots[i] - offset, bend) * gap + baseY);
     vis.set(e.id, win ? Math.max(0, Math.min(1, 1 - Math.max(0, win.start - i, i - (win.start + win.size - 1)))) : 1);
   });
   const ids = entries.map(e => e.id);

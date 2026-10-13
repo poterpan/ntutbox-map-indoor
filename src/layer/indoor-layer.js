@@ -105,6 +105,7 @@ export function createIndoorLayer(options = {}) {
 
   const built = new Map();     // buildingId -> building record
   const loading = new Map();   // buildingId -> Promise<void>
+  const loadGen = new Map();   // buildingId -> unload count (an unload cancels a load in flight)
   const floorCache = new Map(); // "B/F" -> Promise<FeatureCollection>
 
   async function campus() {
@@ -147,8 +148,10 @@ export function createIndoorLayer(options = {}) {
     if (disposed) return Promise.resolve();
     if (built.has(id)) return Promise.resolve();
     if (!loading.has(id)) {
+      const gen = loadGen.get(id) ?? 0;
       const p = fetchFloors(id).then(({ data, order, datas }) => {
-        if (disposed || built.has(id)) return;
+        // unload(id) while the data was in flight cancels this load
+        if (disposed || built.has(id) || (loadGen.get(id) ?? 0) !== gen) return;
         const rec = {
           id, group: new THREE.Group(), order, floors: new Map(), datas: Object.fromEntries(order.map((f, i) => [f, datas[i]])),
           feature: data.buildingsData.features.find(f => f.properties.buildingId === id) || null,
@@ -159,7 +162,7 @@ export function createIndoorLayer(options = {}) {
         object.add(rec.group);
         built.set(id, rec);
         buildBuilding(rec);
-      }).finally(() => loading.delete(id));
+      }).finally(() => { if (loading.get(id) === p) loading.delete(id); });
       loading.set(id, p);
     }
     return loading.get(id);
@@ -266,8 +269,8 @@ export function createIndoorLayer(options = {}) {
     rec.anchorRight = null;
     rec.roomIndex = new Map();
     for (const f of rec.floors.values()) for (const piece of f.pieces) {
-      if (!piece.key) continue;
       piece.floor = f;
+      if (!piece.key) continue;
       if (!rec.roomIndex.has(piece.key)) rec.roomIndex.set(piece.key, []);
       rec.roomIndex.get(piece.key).push(piece);
     }
@@ -813,7 +816,7 @@ export function createIndoorLayer(options = {}) {
   const topColor = new THREE.Color(), sideColor = new THREE.Color(), accent = new THREE.Color();
   function roomLook(piece) {
     const [top, side] = piece.kind ? STATUS[piece.kind] || STATUS.unknown : piece.base || STATUS.unknown;
-    const tint = piece.key === selectedKey ? SELECT_TINT : piece.key === hoverKey ? HOVER_TINT : 0;
+    const tint = !piece.key ? 0 : piece.key === selectedKey ? SELECT_TINT : piece.key === hoverKey ? HOVER_TINT : 0; // keyless (unselectable) pieces never tint: null === null
     accent.setHex(COLORS.accent);
     topColor.setHex(top); sideColor.setHex(side);
     if (tint) { topColor.lerp(accent, tint); sideColor.lerp(accent, tint); }
@@ -855,8 +858,9 @@ export function createIndoorLayer(options = {}) {
   function restyle(rec) {
     for (const f of rec.floors.values()) {
       for (const piece of f.pieces) {
-        if (!piece.key || piece.cls !== 'classroom') continue;
-        const kind = roomStatus(occupancy, piece.key);
+        // Classrooms a host made unselectable have no key, but still show their status colour.
+        if (piece.cls !== 'classroom') continue;
+        const kind = roomStatus(occupancy, piece.key ?? roomKey(piece.feature.properties));
         if (kind === piece.kind) continue;
         piece.kind = kind;
         roomLook(piece);
@@ -917,8 +921,12 @@ export function createIndoorLayer(options = {}) {
   }
 
   function unload(id) {
+    loadGen.set(id, (loadGen.get(id) ?? 0) + 1);
+    loading.delete(id);
     const rec = built.get(id);
     if (!rec) return;
+    if (hoverKey?.startsWith(`${id}/`)) hoverKey = null;
+    if (shown === id) hoverFloor = null;
     if (shown === id) {
       if (tween) { const t = tween; tween = null; t.resolve(false); }
       shown = null;

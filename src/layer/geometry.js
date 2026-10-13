@@ -202,6 +202,9 @@ export function paintRanges(attr, ranges, top, side) {
     for (let i = r.start * 3; i < e; i += 3) { a[i] = c.r; a[i + 1] = c.g; a[i + 2] = c.b; }
     attr.addUpdateRange(r.start * 3, r.count * 3);
   }
+  // Ranges are only cleared when the attribute is uploaded (drawn). A floor that stays hidden while hover /
+  // occupancy keep repainting it would pile them up: past a few dozen, upload the whole attribute instead.
+  if (attr.updateRanges.length > 32) attr.clearUpdateRanges();
   attr.needsUpdate = true;
 }
 

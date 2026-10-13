@@ -552,3 +552,40 @@ test('stackBend: progressive slot spacing (entries mode), 0 keeps the even layou
   close(base('5F'), 50);
   layer.dispose();
 });
+
+test('restyle: classrooms a host made unselectable still follow occupancy colours', async () => {
+  const layer = make({ selectable: () => false });
+  await layer.load('TB');
+  await layer.setPresentation({ building: 'TB', mode: 'floor', floor: '1F' });
+  const occ = new Map([['TB/1F/101', { status: 'free' }], ['TB/1F/102', { status: 'busy' }], ['TB/B1/B01', { status: 'busy' }], ['TB/4F/401', { status: 'busy' }]]);
+  layer.setOccupancy(occ);
+  assert.equal(hexAt(layer, '1F', 6, -6), DEFAULT_PALETTE.free);
+  assert.equal(layer.setOccupancy(new Map([...occ, ['TB/1F/101', { status: 'soon' }]])), false, 'status-only change');
+  assert.equal(hexAt(layer, '1F', 6, -6), DEFAULT_PALETTE.soon, 'recoloured without a key');
+  layer.dispose();
+});
+
+test('unload during an in-flight load cancels it; a later load still works', async () => {
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const src = fixtureSource();
+  const slow = { ...src, floor: async (id, f) => { await gate; return src.floor(id, f); } };
+  const layer = createIndoorLayer({ source: slow, buildings: { TB: { name: 'T', short: 'T' } } });
+  const p = layer.load('TB');
+  layer.unload('TB');
+  release();
+  await p;
+  assert.equal(layer.isLoaded('TB'), false, 'cancelled');
+  assert.equal(layer.object.children.filter(c => c.name === 'indoor-TB').length, 0);
+  await layer.load('TB');
+  assert.equal(layer.isLoaded('TB'), true);
+  layer.dispose();
+});
+
+test('stackBend: spacing stays monotonic far outside the window (linear continuation)', async () => {
+  const { bent } = await import('../src/layer/layout.js');
+  let prev = -Infinity;
+  for (let s = -20; s <= 20; s += .5) { const y = bent(s, -.25); assert.ok(y > prev, `monotonic at ${s}`); prev = y; }
+  close(bent(2, -.1), 2 - .2);
+  close(bent(3, 0), 3);
+});

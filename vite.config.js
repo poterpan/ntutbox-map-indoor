@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { resolve, join, normalize } from 'node:path';
+import { resolve, join, normalize, sep } from 'node:path';
 
 // CAMPUS_DATA=cache serves /campus-data from .cache/campus-v1 (npm run snapshot:campus) instead of the CDN proxy,
 // so visual-regression runs are offline and pinned to one data revision.
@@ -11,7 +11,7 @@ const cachePlugin = {
   configureServer(server) {
     server.middlewares.use('/campus-data', (req, res, next) => {
       const file = normalize(join(CACHE_DIR, decodeURIComponent(req.url.split('?')[0])));
-      if (!file.startsWith(CACHE_DIR) || !existsSync(file) || !statSync(file).isFile()) { res.statusCode = 404; return res.end('not in cache'); }
+      if (!file.startsWith(CACHE_DIR + sep) || !existsSync(file) || !statSync(file).isFile()) { res.statusCode = 404; return res.end('not in cache'); }
       res.setHeader('Content-Type', 'application/json');
       createReadStream(file).pipe(res);
     });

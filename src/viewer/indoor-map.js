@@ -440,15 +440,22 @@ function setStackHover(floorId) {
   renderer.domElement.style.cursor = floorId ? 'pointer' : '';
 }
 
+let switchGen = 0; // latest switchBuilding call wins: a slower earlier load must not take over afterwards
 async function switchBuilding(id, { view = 'stacked', floor = null } = {}) { // view: 'stacked' | 'floor3d' | 'keep'
   if (!BUILDINGS[id] || destroyed) return;
+  const gen = ++switchGen;
   try {
     await layer.load(id);
   } catch (error) {
-    emit('onError', { type: 'building-load-failed', building: id, error });
+    if (gen === switchGen) emit('onError', { type: 'building-load-failed', building: id, error });
     return;
   }
   if (destroyed) return;
+  if (gen !== switchGen) {
+    // Superseded (tap A, then B while A was still loading): drop A's geometry unless it became current.
+    if (id !== buildingId) layer.unload(id);
+    return;
+  }
   const previous = buildingId;
   buildingId = id;
   // One building at a time, as before the layer split: the previous one's geometry is freed (its floor
