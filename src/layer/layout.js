@@ -37,8 +37,8 @@ export function inplaceLayout(floors, { floorHeight, groundY = 0 }) {
 // during the accordion transition. Returns { y, shown, skips: [{ between: [below, above], ids }] }.
 // `entries` (host grouping, docs/LAYER.md「高樓」): [{ id, floors, collapsed }] bottom to top replaces the
 // overview subset; see entryLayout.
-export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = false, entries = null, collapsedSlot = COLLAPSED_SLOT, window = null }) {
-  if (entries) return entryLayout(floors, { gap, baseY, entries, collapsedSlot, window });
+export function stackLayout(floors, { gap, skipExtra = .45, baseY = 0, all = false, entries = null, collapsedSlot = COLLAPSED_SLOT, window = null, bend = 0 }) {
+  if (entries) return entryLayout(floors, { gap, baseY, entries, collapsedSlot, window, bend });
   const ids = overviewIds(floors, { all });
   const byId = new Map(floors.map(f => [f.id, f]));
   const y = new Map();
@@ -88,8 +88,10 @@ export function clampWindow(win, n) {
 // Host-grouped overview: one slot per entry, its representative floor `id` drawn there; a collapsed entry's
 // slot is `collapsedSlot` high. With a window only entries start … start + size − 1 show (visibility 0..1 at
 // fractional edges) and the window's bottom entry sits at baseY, so scrolling slides the floors through a
-// fixed frame. Returns { y, shown, skips: [], vis: Map<entry id, 0..1>, slots }.
-export function entryLayout(floors, { gap, baseY = 0, entries, collapsedSlot = COLLAPSED_SLOT, window = null }) {
+// fixed frame. `bend` (fraction per slot) spaces slots progressively: slot s sits at gap·(s + bend·s²/2), so a
+// perspective host can tighten the floors nearer its camera (negative bend) and keep them evenly spaced on screen.
+// Returns { y, shown, skips: [], vis: Map<entry id, 0..1>, slots }.
+export function entryLayout(floors, { gap, baseY = 0, entries, collapsedSlot = COLLAPSED_SLOT, window = null, bend = 0 }) {
   const slots = [];
   let s = 0, prevH = 0;
   entries.forEach((e, i) => {
@@ -107,7 +109,8 @@ export function entryLayout(floors, { gap, baseY = 0, entries, collapsedSlot = C
   }
   const y = new Map();
   entries.forEach((e, i) => {
-    y.set(e.id, (slots[i] - offset) * gap + baseY);
+    const sl = slots[i] - offset;
+    y.set(e.id, (sl + bend * sl * sl / 2) * gap + baseY);
     vis.set(e.id, win ? Math.max(0, Math.min(1, 1 - Math.max(0, win.start - i, i - (win.start + win.size - 1)))) : 1);
   });
   const ids = entries.map(e => e.id);

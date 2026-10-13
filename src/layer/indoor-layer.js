@@ -394,6 +394,7 @@ export function createIndoorLayer(options = {}) {
       focusY: p.focusY, screenRight: p.screenRight ?? null,
       // Windowed stack (entries mode): which entries show; null = all.
       stackWindow: mode === 'stack' && rec?.entries ? clampWindow(p.stackWindow, rec.entries.length) : null,
+      stackBend: p.stackBend ?? 0,
       animate: !!p.animate, duration: p.duration ?? 650, easing: p.easing ?? easeInOutCubic,
     };
     if (!['inplace', 'stack', 'floor'].includes(mode)) throw new Error(`unknown presentation mode ${mode}`);
@@ -408,7 +409,7 @@ export function createIndoorLayer(options = {}) {
     const list = floorList(rec);
     if (!p.building || p.mode === 'inplace') return inplaceLayout(list, { floorHeight: opts.floorHeight, groundY: opts.groundY });
     if (p.mode === 'stack') {
-      const st = stackLayout(list, { gap: p.stackGap, skipExtra: p.skipExtra, entries: rec.entries, window: p.stackWindow });
+      const st = stackLayout(list, { gap: p.stackGap, skipExtra: p.skipExtra, entries: rec.entries, window: p.stackWindow, bend: p.stackBend });
       rec.stackVis = st.vis || null;
       return st.y;
     }

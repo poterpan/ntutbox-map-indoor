@@ -143,6 +143,7 @@ AM（先鋒 21 層）這種高樓整棟擠不下：徽章疊在一起、手機�
 type StackGrouping = (floors: StackFloorInfo[], buildingId) => Array<string | string[]>;
 // StackFloorInfo = FloorStats ＋ spaces（該層所有空間的 SpaceInfo）。由下往上、照順序；陣列＝收合的一段
 setPresentation({ mode: 'stack', stackWindow: { start, size } })  // 只顯示第 start … start+size−1 格（start 可帶小數＝拖曳中）
+setPresentation({ mode: 'stack', stackBend })  // 漸進層距：第 s 格在 stackGap·(s + bend·s²/2)；透視宿主給小負值，讓離相機近（較高）的樓層在畫面上不會比較疏
 layer.stackEntries(id): StackEntry[]   // { id（畫出來的那層）, floors, collapsed, label: '7F' | 'R1–R3' }
 ```
 

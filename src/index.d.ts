@@ -262,6 +262,9 @@ export interface PresentationOptions {
    *  indices, bottom first). The window's bottom entry sits where the first entry would, so the camera can stay put
    *  while the window scrolls; start may be fractional (dragging: the edge entries fade). Clamped; null = all. */
   stackWindow?: { start: number; size: number } | null;
+  /** Stack, entries mode: progressive spacing, slot s (from the window's bottom) at stackGap·(s + bend·s²/2). A perspective
+   *  host passes a small negative value so floors nearer its camera (higher up) are not spaced wider on screen. Default 0. */
+  stackBend?: number;
   /** Ground direction [x, z] pointing to the screen's right; floor badges and skip markers line up on the
    *  opposite (left) edge of the stack. Default: the previous value, else [1, 0] (east). */
   screenRight?: [number, number];
@@ -284,6 +287,7 @@ export interface Presentation {
   readonly screenRight: [number, number] | null;
   /** Clamped stack window, or null. */
   readonly stackWindow: { readonly start: number; readonly size: number } | null;
+  readonly stackBend: number;
 }
 
 /** One entry of the stack overview, bottom to top. */

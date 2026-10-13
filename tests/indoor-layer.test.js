@@ -539,3 +539,16 @@ test('floorOutline: the slab outline of a floor in the layer frame', async () =>
   assert.deepEqual(layer.floorOutline('TB', 'XX'), []);
   layer.dispose();
 });
+
+test('stackBend: progressive slot spacing (entries mode), 0 keeps the even layout', async () => {
+  const layer = make({ stackFloors: 'all' });
+  await layer.load('TB');
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10, stackBend: -0.1 });
+  const base = id => layer.floorBox('TB', id).min.y - layer.floorBox('TB', 'B1').min.y;
+  close(base('1F'), 10 * (1 - 0.05));
+  close(base('5F'), 10 * (5 - 0.1 * 25 / 2));
+  assert.equal(layer.presentation.stackBend, -0.1);
+  await layer.setPresentation({ building: 'TB', mode: 'stack', stackGap: 10 });
+  close(base('5F'), 50);
+  layer.dispose();
+});
