@@ -1567,8 +1567,14 @@ function representForStage() {
   fitCurrent(false);
 }
 
+// Compact chrome (floor rail, compass) when the map's own container is small. The course site shows the map in a
+// ~620×640 pane next to the room list on desktop and ~358×478 on phones; the full-size rail took 9–16 % of the
+// width and up to 73 % of the height there. Keyed on the container, not the viewport (a CSS container query would
+// need size containment on a host-sized element).
+const COMPACT = { width: 720, height: 560 };
 function resize() {
   if (destroyed) return;
+  root.classList.toggle('compact', root.clientWidth < COMPACT.width || root.clientHeight < COMPACT.height);
   renderer.setSize(root.clientWidth, root.clientHeight, false);
   if (!started) return;
   cachedInsets = safeInsets();

@@ -47,7 +47,8 @@
     "snapshot:campus": "node scripts/campus-snapshot.mjs",
     "visual:capture": "node tests/visual/capture.mjs",
     "visual:compare": "node tests/visual/compare.mjs",
-    "visual:switch-race": "node tests/visual/switch-race.mjs"
+    "visual:switch-race": "node tests/visual/switch-race.mjs",
+    "visual:rail": "node tests/visual/rail.mjs"
   },
   "peerDependencies": {
     "three": ">=0.180.0 <1.0.0"

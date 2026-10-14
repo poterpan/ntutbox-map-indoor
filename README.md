@@ -42,6 +42,7 @@ map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 ```
 
 - **引擎只負責地圖本身**：canvas、畫面內標籤、樓層列、指北針。標題、圖例、教室卡片、底部面板都由宿主依 callback 自己畫。
+  容器窄於 720 px 或矮於 560 px 時（例如排課站桌機的 620×640 地圖窗格、手機的 358×478），樓層列與指北針自動改成精簡尺寸（根元素加 `.compact`，依容器大小、不看視窗）；樓層多時樓層列自己捲動，按鈕不會被壓扁，也不會疊到指北針。
 - **狀態由宿主推進來**：引擎不懂課表。`status` 是 `free`／`soon`／`busy`／`unknown`；換一節課只重新上色，不重建幾何。
 - **教室的範圍由 `occupancy` 的鍵決定**：有鍵的空間就算教室。GIS 標成教室、但不在 `occupancy` 裡的空間顯示「無課表資料」。
 - 排課站怎麼把課表算成 `occupancy`，可以參考 [`dev/course-occupancy.js`](dev/course-occupancy.js)（它不在套件裡）。

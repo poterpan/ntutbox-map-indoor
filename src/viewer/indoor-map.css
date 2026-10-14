@@ -13,6 +13,7 @@
 .indoor-map .floor-button {
   min-width: 46px; height: 36px; border: 0; border-radius: 10px; background: transparent; color: #8b8f98;
   font-weight: 720; cursor: pointer; position: relative; padding: 0 8px;
+  flex: none; /* a long rail (AM, 22 entries) scrolls; the buttons never shrink */
 }
 .indoor-map .floor-button.active { color: white; background: var(--im-blue); }
 .indoor-map .label {
@@ -88,3 +89,14 @@
 .indoor-map .label.unknown { color: #9aa0aa; font-weight: 650; }
 /* Overview: the floor that is big enough to enter lights up before a further zoom-in enters it. */
 .indoor-map .label.floor-badge.ready { box-shadow: 0 0 0 2px var(--im-blue), 0 7px 20px rgba(37,44,66,.14); color: var(--im-blue); }
+
+/* Compact chrome: the viewer sets .compact on its root when the container is narrower than 720 px or shorter than
+   560 px (course site: the map pane next to the room list, phones). Smaller rail and compass; buttons keep a 28 px
+   tap height and never shrink (a long rail scrolls instead of squeezing the buttons); the rail stops above the compass. */
+.indoor-map.compact .floor-rail { right: 10px; top: 60px; gap: 2px; padding: 3px; border-radius: 11px; max-height: calc(100% - 60px - 66px); }
+.indoor-map.compact .floor-button { flex: none; min-width: 38px; height: 28px; padding: 0 6px; border-radius: 8px; font-size: 12px; }
+.indoor-map.compact .floor-button.all { font-size: 11px; border-radius: 8px 8px 3px 3px; }
+.indoor-map.compact .compass { right: 12px; bottom: 14px; width: 36px; height: 36px; }
+.indoor-map.compact .compass .dial { width: 26px; height: 26px; }
+.indoor-map.compact .compass .dial b { font-size: 10px; margin-top: 5px; }
+.indoor-map.compact .compass .dial i { font-size: 9px; }
