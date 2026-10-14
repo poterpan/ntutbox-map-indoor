@@ -589,3 +589,45 @@ test('stackBend: spacing stays monotonic far outside the window (linear continua
   close(bent(2, -.1), 2 - .2);
   close(bent(3, 0), 3);
 });
+
+test('collapseDegenerateTriangles: zero-normal triangles become a point with an up normal; others untouched', async () => {
+  const { collapseDegenerateTriangles } = await import('../src/layer/geometry.js');
+  const pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1, /* sliver */ 5, 1, 5, 6, 1, 6, 7, 1, 7]);
+  const nor = new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(collapseDegenerateTriangles(pos, nor), 1);
+  assert.deepEqual([...pos.slice(0, 9)], [0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  assert.deepEqual([...pos.slice(9)], [5, 1, 5, 5, 1, 5, 5, 1, 5]);
+  assert.deepEqual([...nor.slice(9)], [0, 1, 0, 0, 1, 0, 0, 1, 0]);
+  // And nothing the layer draws (the warm-up triangle included) has a zero-length normal.
+  const layer = make();
+  await layer.load('TB');
+  let bad = 0;
+  layer.object.traverse(o => { const a = o.isMesh && o.geometry.attributes.normal; if (!a) return; for (let k = 0; k < a.count; k++) if (!(Math.hypot(a.getX(k), a.getY(k), a.getZ(k)) > .5)) bad++; });
+  assert.equal(bad, 0);
+  layer.dispose();
+});
+
+test('spaceWalls hook: classrooms only by default; a host can wall other spaces; palette wallTop colours the wall tops', async () => {
+  const wallsOn = (layer, floor) => { let n = 0, m = null; layer.object.traverse(o => { if (o.userData?.part === 'walls' && o.userData.floorId === floor) { n = o.geometry.attributes.position.count / 3; m = o; } }); return { n, m }; };
+  const plain = make();
+  await plain.load('TB');
+  assert.equal(wallsOn(plain, '2F').n, 0, 'no classroom on 2F: no walls by default');
+  const one = wallsOn(plain, '1F');
+  assert.ok(one.n > 0, 'classrooms keep their walls');
+  // Default: every wall vertex in the wall side colour (top included).
+  const side = new THREE.Color(DEFAULT_PALETTE.wallSide), col = one.m.geometry.attributes.color;
+  for (let i = 0; i < col.count; i++) assert.ok(Math.abs(col.getX(i) - side.r) < 1e-6);
+  plain.dispose();
+  const host = make({ spaceWalls: s => s.cls === 'classroom' || s.type === '學生輔導中心辦公室', palette: { wallTop: 0xffffff } });
+  await host.load('TB');
+  assert.ok(wallsOn(host, '2F').n > 0, 'the office on 2F gets walls');
+  assert.equal(wallsOn(host, '1F').n, one.n, 'classrooms unchanged');
+  // wallTop: the upward faces are white, the sides stay wallSide.
+  const w = wallsOn(host, '1F').m.geometry, nor = w.attributes.normal, c = w.attributes.color;
+  let tops = 0, sides = 0;
+  for (let i = 0; i < nor.count; i++) {
+    if (nor.getY(i) > .9) { tops++; assert.equal(c.getX(i), 1); } else { sides++; assert.ok(Math.abs(c.getX(i) - side.r) < 1e-6); }
+  }
+  assert.ok(tops > 0 && sides > 0);
+  host.dispose();
+});

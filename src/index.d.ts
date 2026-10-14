@@ -194,6 +194,8 @@ export interface IndoorPalette {
   restroom: number; restroomSide: number;
   service: number; serviceSide: number;
   wall: number; wallSide: number;
+  /** Top face of the low walls; default wallSide (the same colour all round). */
+  wallTop?: number;
   /** Room edges, neighbour-floor outlines. */
   outline: number;
   /** Outer edge of the focused floor. */
@@ -392,6 +394,8 @@ export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
   badgeAnchor?: 'middle' | 'near';
   /** Override how a space is drawn; return null to keep the default class. 'room' = drawn like a room in the place colour. */
   spaceClass?: (space: SpaceInfo) => SpaceClass | null;
+  /** Low walls around this space (any drawn space). Default: classrooms only. Evaluated at build time. */
+  spaceWalls?: (space: SpaceInfo) => boolean;
   /** Stack hover emphasis (setHoveredFloor). Default null = the classic look (other floors .28, nothing else).
    *  fade: other floors' fill; outline: accent outline on the hovered floor (default true); lift: rise as a
    *  fraction of stackGap; the hovered floor's badge kind gets ' hover'. */

@@ -47,6 +47,7 @@ export function createIndoorLayer(options = {}) {
     selectable: null,
     spaceLabel: null,
     spaceClass: null,
+    spaceWalls: null,
     badgeAnchor: 'middle',
     hoverStyle: null,
     ...options,
@@ -93,7 +94,7 @@ export function createIndoorLayer(options = {}) {
   let warm = null, warmUpdates = 0;
   if (OPAQUE_AT_REST) {
     const g = new THREE.BufferGeometry();
-    for (const name of ['position', 'normal', 'color']) g.setAttribute(name, new THREE.BufferAttribute(new Float32Array(9), 3));
+    for (const name of ['position', 'normal', 'color']) g.setAttribute(name, new THREE.BufferAttribute(new Float32Array(name === 'normal' ? [0, 1, 0, 0, 1, 0, 0, 1, 0] : 9), 3));
     warm = new THREE.Mesh(g, fillMaterial({ fog, transparent: false }));
     warm.frustumCulled = false;
     warm.receiveShadow = receiveShadows;
@@ -224,6 +225,7 @@ export function createIndoorLayer(options = {}) {
         spaceOf: f => spaces.get(f) || null,
         ...(opts.spaceClass ? { classify: p => clsOf.get(p) ?? classifyFeature(p, occupancy) } : {}),
         ...(opts.spaceLabel ? { labelFor: info => hook('spaceLabel', null, info) } : {}),
+        ...(opts.spaceWalls ? { wallsFor: f => { const info = spaces.get(f); return !!info && !!hook('spaceWalls', false, info); } } : {}),
       });
       floor.stats = statsForFloor(features, rec.id, floorId, occupancy);
       floor.y = 0;

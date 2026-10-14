@@ -119,6 +119,7 @@ createIndoorLayer({
   spaceLabel?: (space: SpaceInfo) => { text, priority?, kind?, fadeIn? } | null,  // 取代預設標籤（正門除外），每個 key 一個
   spaceClass?: (space: SpaceInfo) => SpaceClass | null,  // 改畫法；'room'＝具名地點：place 色、教室高度、邊線（不加矮牆）
   badgeAnchor?: 'middle' | 'near',             // 透視宿主用 near：徽章在總覽靠相機那側，不壓到下面的樓層
+  spaceWalls?: (space: SpaceInfo) => boolean,  // 哪些空間圍矮牆；預設只有教室（排課站像素不變）。找路宿主可以給所有能選的地點
   hoverStyle?: { fade?, outline?, lift? },     // 整棟 hover 強調：其他層淡到 fade、該層 accent 外框＋浮起 lift×stackGap、
                                                // 畫在淡化層之後（完整不透明）、徽章 kind 加 ' hover'。null＝排課站原樣（其他層 .28）
 })
@@ -134,6 +135,9 @@ layer.spaces(buildingId): SpaceInfo[]          // 一個 key 一筆；之後給�
 - `spaceLabel` 不給 `kind` 時：教室用佔用狀態（free／busy…，宿主之後接 `setOccupancy` 就有顏色），其他是 `poi`（密度淡出）。
   `fadeIn: [from, to]`（每公尺像素）由 overlay 處理：房間小、名稱長的標籤放大到放得下才淡入。
 - 'room' 不加矮牆：宿主可能標幾百間，矮牆會蓋掉房間色（第二段時每段牆還是一個 draw call，AM 整棟 2733 → 2092 calls；第三段合併後牆不再影響 draw call，不加牆是畫法的選擇）。
+- 矮牆（0.12.1）：`spaceWalls(space)` 決定哪些空間圍矮牆（建幾何時算，預設＝`cls === 'classroom'`）；牆合併成每層一個 mesh，
+  加牆只增加三角形、不增加 draw call。牆頂顏色可用 palette `wallTop`（預設＝`wallSide`，四面同色）；透視宿主從斜上方看，
+  給淺一點的頂面比較讀得出牆的位置。
 
 ## 高樓：收合與視窗（0.12 第三輪，2026-10-12）
 
