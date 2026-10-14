@@ -47,6 +47,7 @@ export function createIndoorLayer(options = {}) {
     selectable: null,
     spaceLabel: null,
     spaceClass: null,
+    spaceWalls: null,
     badgeAnchor: 'middle',
     hoverStyle: null,
     ...options,
@@ -224,6 +225,7 @@ export function createIndoorLayer(options = {}) {
         spaceOf: f => spaces.get(f) || null,
         ...(opts.spaceClass ? { classify: p => clsOf.get(p) ?? classifyFeature(p, occupancy) } : {}),
         ...(opts.spaceLabel ? { labelFor: info => hook('spaceLabel', null, info) } : {}),
+        ...(opts.spaceWalls ? { wallsFor: f => { const info = spaces.get(f); return !!info && !!hook('spaceWalls', false, info); } } : {}),
       });
       floor.stats = statsForFloor(features, rec.id, floorId, occupancy);
       floor.y = 0;

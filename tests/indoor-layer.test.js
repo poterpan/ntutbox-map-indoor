@@ -606,3 +606,28 @@ test('collapseDegenerateTriangles: zero-normal triangles become a point with an 
   assert.equal(bad, 0);
   layer.dispose();
 });
+
+test('spaceWalls hook: classrooms only by default; a host can wall other spaces; palette wallTop colours the wall tops', async () => {
+  const wallsOn = (layer, floor) => { let n = 0, m = null; layer.object.traverse(o => { if (o.userData?.part === 'walls' && o.userData.floorId === floor) { n = o.geometry.attributes.position.count / 3; m = o; } }); return { n, m }; };
+  const plain = make();
+  await plain.load('TB');
+  assert.equal(wallsOn(plain, '2F').n, 0, 'no classroom on 2F: no walls by default');
+  const one = wallsOn(plain, '1F');
+  assert.ok(one.n > 0, 'classrooms keep their walls');
+  // Default: every wall vertex in the wall side colour (top included).
+  const side = new THREE.Color(DEFAULT_PALETTE.wallSide), col = one.m.geometry.attributes.color;
+  for (let i = 0; i < col.count; i++) assert.ok(Math.abs(col.getX(i) - side.r) < 1e-6);
+  plain.dispose();
+  const host = make({ spaceWalls: s => s.cls === 'classroom' || s.type === '學生輔導中心辦公室', palette: { wallTop: 0xffffff } });
+  await host.load('TB');
+  assert.ok(wallsOn(host, '2F').n > 0, 'the office on 2F gets walls');
+  assert.equal(wallsOn(host, '1F').n, one.n, 'classrooms unchanged');
+  // wallTop: the upward faces are white, the sides stay wallSide.
+  const w = wallsOn(host, '1F').m.geometry, nor = w.attributes.normal, c = w.attributes.color;
+  let tops = 0, sides = 0;
+  for (let i = 0; i < nor.count; i++) {
+    if (nor.getY(i) > .9) { tops++; assert.equal(c.getX(i), 1); } else { sides++; assert.ok(Math.abs(c.getX(i) - side.r) < 1e-6); }
+  }
+  assert.ok(tops > 0 && sides > 0);
+  host.dispose();
+});

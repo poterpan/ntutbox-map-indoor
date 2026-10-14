@@ -277,7 +277,8 @@ function mergeLines(geoms) {
 // Optional host hooks (the layer passes them; without them the floor is built exactly as before):
 //   classify(p) → space class ('room' = a named place: raised fill + edges in the `place` colour, no low walls);
 //   spaceOf(feature) → { key, selectable, … } (SpaceInfo); selectable spaces get a key, tint and outline;
-//   labelFor(info, cls) → { text, priority?, kind?, fadeIn? } | null, replacing the default labels.
+//   labelFor(info, cls) → { text, priority?, kind?, fadeIn? } | null, replacing the default labels;
+//   wallsFor(feature, cls) → bool: low walls around this space (default: classrooms only).
 // floor.pieces: one entry per drawn polygon { feature, cls, kind?, base?, key, space, slab?, mesh: 'base'|'cast',
 // ranges, box (floor-local), shape, depth, y }; floor.meshes: { base, cast, walls, edges, spaceEdges } (absent
 // when empty); floor.proxy: the pick proxy (userData.pieces: triangle → index into floor.pieces).
@@ -314,7 +315,9 @@ export function buildFloor(ctx) {
     // Bottom at y = 0; the merged wall mesh sits at WALL.base and grows with scale.y.
     const geom = new THREE.BoxGeometry(len, WALL.height, WALL.thickness)
       .translate(0, WALL.height / 2, 0).rotateY(-Math.atan2(dz, dx)).translate((x1 + x2) / 2, 0, (z1 + z2) / 2);
-    wallGeoms.push({ geom, top: COLORS.wallSide, side: COLORS.wallSide });
+    // Box faces: +x, −x, +y, −y, +z, −z. mergeParts paints group 0 `top`, so mark the +y face as the top.
+    geom.groups.forEach((g, i) => { g.materialIndex = i === 2 ? 0 : 1; });
+    wallGeoms.push({ geom, top: COLORS.wallTop ?? COLORS.wallSide, side: COLORS.wallSide });
   };
   // Plan coordinates (x, north) in; walls are placed at world (x, −north).
   const addDedupedWall = (ax, ay, bx, by) => {
@@ -411,6 +414,8 @@ export function buildFloor(ctx) {
     if (!style) return;
     const key = keyOf(feature, cls);
     const caster = isRoomCls(cls) || cls === 'vertical' || cls === 'restroom';
+    // Low walls: classrooms by default; a host can ask for them around other spaces (wallsFor).
+    const walled = ctx.wallsFor ? !!ctx.wallsFor(feature, cls) : cls === 'classroom';
     const info = spaceOf(feature);
     for (const rings of ringsFromGeometry(feature.geometry)) {
       const shape = shapeFromRings(rings, project);
@@ -425,13 +430,12 @@ export function buildFloor(ctx) {
       parts[piece.mesh].push({ geom, top: style.colors[0], side: style.colors[1], piece });
       if (isRoomCls(cls)) {
         edgeGeoms.push(new THREE.EdgesGeometry(geom, 25).translate(0, .006, 0));
-        // Low walls only around classrooms: hosts may mark hundreds of places as 'room'.
-        if (cls === 'classroom') addRoomLowWalls(feature);
       } else if (cls === 'service' || cls === 'vertical' || cls === 'restroom') {
         // Plan-style boundaries between the many neutral spaces; only drawn on the focused floor.
         spaceEdgeGeoms.push(new THREE.EdgesGeometry(geom, 25).translate(0, .006, 0));
       }
     }
+    if (walled) addRoomLowWalls(feature);
     addFeatureLabels(feature, cls, key);
   };
 
