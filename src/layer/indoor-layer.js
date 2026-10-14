@@ -93,7 +93,7 @@ export function createIndoorLayer(options = {}) {
   let warm = null, warmUpdates = 0;
   if (OPAQUE_AT_REST) {
     const g = new THREE.BufferGeometry();
-    for (const name of ['position', 'normal', 'color']) g.setAttribute(name, new THREE.BufferAttribute(new Float32Array(9), 3));
+    for (const name of ['position', 'normal', 'color']) g.setAttribute(name, new THREE.BufferAttribute(new Float32Array(name === 'normal' ? [0, 1, 0, 0, 1, 0, 0, 1, 0] : 9), 3));
     warm = new THREE.Mesh(g, fillMaterial({ fog, transparent: false }));
     warm.frustumCulled = false;
     warm.receiveShadow = receiveShadows;

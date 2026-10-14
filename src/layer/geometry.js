@@ -208,6 +208,23 @@ export function paintRanges(attr, ranges, top, side) {
   attr.needsUpdate = true;
 }
 
+// Collinear points in a GIS ring (arcs drawn as many exactly collinear integer-cm points, around a hole) make the
+// triangulator emit zero-area cap triangles whose normals are (0, 0, 0). normalize() of that is NaN in the shader;
+// in a host's half-float post-processing chain one NaN pixel spreads (bloom mip blur) into a large black block
+// (map.ntutbox.com, 宏裕, 2026-10-14). Collapses every such triangle to a point (never rasterised) with an up
+// normal. Non-indexed position / normal arrays; returns how many triangles were collapsed.
+export function collapseDegenerateTriangles(pos, nor) {
+  let n = 0;
+  for (let t = 0; t + 8 < nor.length; t += 9) {
+    let bad = false;
+    for (let k = 0; k < 9; k += 3) if (!(Math.hypot(nor[t + k], nor[t + k + 1], nor[t + k + 2]) > .5)) bad = true;
+    if (!bad) continue;
+    for (let k = 0; k < 9; k += 3) { pos[t + k] = pos[t]; pos[t + k + 1] = pos[t + 1]; pos[t + k + 2] = pos[t + 2]; nor[t + k] = 0; nor[t + k + 1] = 1; nor[t + k + 2] = 0; }
+    n++;
+  }
+  return n;
+}
+
 // Concatenates parts ({ geom, top, side, piece? }) into one non-indexed geometry with position, normal and
 // colour. An extrusion's group 0 (its caps) is painted `top`, the rest `side`; piece.ranges records where the
 // part landed (in vertices). The part geometries are disposed.
@@ -234,6 +251,7 @@ function mergeParts(parts) {
     g.dispose();
   });
   color.clearUpdateRanges();
+  collapseDegenerateTriangles(pos, nor);
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geom.setAttribute('normal', new THREE.BufferAttribute(nor, 3));

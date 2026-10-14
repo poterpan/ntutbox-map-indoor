@@ -1,6 +1,6 @@
 {
   "name": "@ntutbox/map-indoor",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "北科盒子（NTUT Box）校園與室內地圖：2.5D 樓層圖、空教室著色、校園白模，讀取公開的校園資料 CDN",
   "license": "MIT",
   "author": "PoterPan",

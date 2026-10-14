@@ -589,3 +589,20 @@ test('stackBend: spacing stays monotonic far outside the window (linear continua
   close(bent(2, -.1), 2 - .2);
   close(bent(3, 0), 3);
 });
+
+test('collapseDegenerateTriangles: zero-normal triangles become a point with an up normal; others untouched', async () => {
+  const { collapseDegenerateTriangles } = await import('../src/layer/geometry.js');
+  const pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1, /* sliver */ 5, 1, 5, 6, 1, 6, 7, 1, 7]);
+  const nor = new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(collapseDegenerateTriangles(pos, nor), 1);
+  assert.deepEqual([...pos.slice(0, 9)], [0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  assert.deepEqual([...pos.slice(9)], [5, 1, 5, 5, 1, 5, 5, 1, 5]);
+  assert.deepEqual([...nor.slice(9)], [0, 1, 0, 0, 1, 0, 0, 1, 0]);
+  // And nothing the layer draws (the warm-up triangle included) has a zero-length normal.
+  const layer = make();
+  await layer.load('TB');
+  let bad = 0;
+  layer.object.traverse(o => { const a = o.isMesh && o.geometry.attributes.normal; if (!a) return; for (let k = 0; k < a.count; k++) if (!(Math.hypot(a.getX(k), a.getY(k), a.getZ(k)) > .5)) bad++; });
+  assert.equal(bad, 0);
+  layer.dispose();
+});
