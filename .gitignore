@@ -3,3 +3,5 @@ dist/
 .DS_Store
 *.tgz
 .playwright-mcp/
+.cache/
+visual-out/

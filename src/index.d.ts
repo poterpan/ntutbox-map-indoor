@@ -1,6 +1,8 @@
 // Type definitions for @ntutbox/map-indoor. The runtime is plain JavaScript (src/index.js); keep these in step
-// with createIndoorMap's options, callbacks and returned API.
+// with createIndoorMap's options, callbacks and returned API, and with createIndoorLayer / createLabelOverlay
+// (docs/LAYER.md). The layer and overlay types reference three.js types (install @types/three to use them).
 import type { FeatureCollection, MultiPolygon, Polygon } from './geojson.js';
+import type { Box3, Camera, Group, Object3D, Raycaster, Vector3 } from 'three';
 
 export type RoomStatus = 'free' | 'soon' | 'busy' | 'unknown';
 export const ROOM_STATUSES: readonly RoomStatus[];
@@ -174,3 +176,324 @@ export interface IndoorMap<O extends HasStatus = OccupancyRecord> {
 
 /** Must run in the browser; throws when WebGL is unavailable. The engine adds its own element inside `container`. */
 export function createIndoorMap<O extends HasStatus = OccupancyRecord>(container: HTMLElement, options?: IndoorMapOptions<O>): IndoorMap<O>;
+
+// ---------------------------------------------------------------------------------------------
+// IndoorLayer: the indoor floors in a host's own three.js scene (docs/LAYER.md).
+// World frame: Y-up metres, x = E − 302800, y = height, z = −(N − 2770400) (TWD97). Never transform layer.object.
+// ---------------------------------------------------------------------------------------------
+
+/** Indoor colours (hex). Status fills: free / soon / room (= busy) / unknown, each with a darker side colour. */
+export interface IndoorPalette {
+  slabTop: number; slabSide: number;
+  room: number; roomSide: number;
+  free: number; freeSide: number;
+  soon: number; soonSide: number;
+  unknown: number; unknownSide: number;
+  corridor: number; corridorSide: number;
+  vertical: number; verticalSide: number;
+  restroom: number; restroomSide: number;
+  service: number; serviceSide: number;
+  wall: number; wallSide: number;
+  /** Room edges, neighbour-floor outlines. */
+  outline: number;
+  /** Outer edge of the focused floor. */
+  focusEdge: number;
+  /** Selection / hover tint and selection outline. */
+  accent: number;
+  /** Spaces a host draws as rooms (spaceClass → 'room'). */
+  place: number; placeSide: number;
+}
+
+/** Space class: how a space is drawn. 'room' (a named non-classroom place drawn like a room) only comes from spaceClass. */
+export type SpaceClass = 'classroom' | 'room' | 'corridor' | 'vertical' | 'restroom' | 'service';
+
+/** One drawn indoor space (split GIS polygons of one room share a key). Read-only. */
+export interface SpaceInfo {
+  /** Classrooms "B/F/classNumber"; other spaces "B/F/number" for a number's primary space, else their GIS id ("B/F/501#2", "B/F/~hash"). */
+  readonly key: string;
+  readonly buildingId: string;
+  readonly floorId: string;
+  /** GIS space id (CDN `id`). */
+  readonly id: string | null;
+  /** CDN `t`: a type (教室, 研究室, 男廁…) or a proper name (學生輔導中心辦公室, 國家太空中心…). */
+  readonly type: string | null;
+  /** CDN `te`: English name / category, often missing. */
+  readonly typeEn: string | null;
+  /** CDN `n`: room / door number. */
+  readonly number: string | null;
+  /** CDN `c`: GIS category code (001 / 002 classrooms, 501 restrooms, 503 elevators, 504 stairs, 505 corridors…). */
+  readonly category: string | null;
+  readonly cls: SpaceClass | string;
+  /** m², of the largest polygon piece. */
+  readonly area: number;
+  /** selectable(space) at build time: has a key in pick / setSelected / roomBox. */
+  readonly selectable: boolean;
+}
+
+/** What spaceLabel returns: replaces the default labels (room numbers, 電梯／樓梯／WC). */
+export interface SpaceLabelSpec {
+  text: string;
+  /** Collision order, higher first. Default as for the built-in labels. */
+  priority?: number;
+  /** Label kind for classFor. Default: the room status for classrooms, else 'poi' (density declutter). */
+  kind?: string;
+  /** Fade in between these screen densities [from, to] (px per metre), e.g. to hide long names on small rooms until zoomed in. */
+  fadeIn?: [number, number];
+}
+
+export type PresentationMode = 'inplace' | 'stack' | 'floor';
+
+export interface PresentationOptions {
+  /** Building to show (must be loaded), or null to hide (animated: it drops to its real heights and fades out). */
+  building: string | null;
+  /** 'inplace' every floor at its elevation; 'stack' exploded overview; 'floor' one floor. Default 'stack'. */
+  mode?: PresentationMode;
+  /** Required for mode 'floor'. */
+  floor?: string | null;
+  /** Stack: distance between overview floors (m). Default 3 × floorHeight. Changing it only re-lays out. */
+  stackGap?: number;
+  /** Stack: extra gap, as a fraction of stackGap, where floors without classrooms were skipped (stackFloors 'classrooms'). Default .45. */
+  skipExtra?: number;
+  /** Floor: spacing per storey around the focused floor. Default floorHeight. */
+  floorGap?: number;
+  /** Floor: base height of the focused floor. Default max(elevation(floor), groundY). */
+  focusY?: number;
+  /** Stack, entries mode (stackFloors 'all' or a function): show only entries start … start + size − 1 (entry
+   *  indices, bottom first). The window's bottom entry sits where the first entry would, so the camera can stay put
+   *  while the window scrolls; start may be fractional (dragging: the edge entries fade). Clamped; null = all. */
+  stackWindow?: { start: number; size: number } | null;
+  /** Stack, entries mode: progressive spacing, slot s (from the window's bottom) at stackGap·(s + bend·s²/2). A perspective
+   *  host passes a small negative value so floors nearer its camera (higher up) are not spaced wider on screen. Default 0. */
+  stackBend?: number;
+  /** Ground direction [x, z] pointing to the screen's right; floor badges and skip markers line up on the
+   *  opposite (left) edge of the stack. Default: the previous value, else [1, 0] (east). */
+  screenRight?: [number, number];
+  animate?: boolean;
+  /** ms, default 650. */
+  duration?: number;
+  /** Default easeInOutCubic. */
+  easing?: (t: number) => number;
+}
+
+/** The current target presentation (where the layer is, or is going). */
+export interface Presentation {
+  readonly building: string | null;
+  readonly mode: PresentationMode;
+  readonly floor: string | null;
+  readonly stackGap: number;
+  readonly skipExtra: number;
+  readonly floorGap: number;
+  readonly focusY?: number;
+  readonly screenRight: [number, number] | null;
+  /** Clamped stack window, or null. */
+  readonly stackWindow: { readonly start: number; readonly size: number } | null;
+  readonly stackBend: number;
+}
+
+/** One entry of the stack overview, bottom to top. */
+export interface StackEntry {
+  /** The floor drawn for this entry (a collapsed run: its floor nearest the ground); badge id badge:B/<id>. */
+  readonly id: string;
+  /** Floors the entry stands for (one, or a collapsed run). */
+  readonly floors: readonly string[];
+  /** A run returned as an array by stackFloors: drawn in a compact slot, badge text "R1–R3". */
+  readonly collapsed: boolean;
+  /** "7F", or "R1–R3" for a run. */
+  readonly label: string;
+}
+
+/** What a stackFloors function gets per floor (bottom to top). */
+export interface StackFloorInfo extends FloorStats {
+  /** Every drawn space of the floor (selectable or not). */
+  readonly spaces: readonly SpaceInfo[];
+}
+
+/** Host grouping of the stack: floor ids, or arrays of floor ids (a collapsed run), bottom to top and in order.
+ *  Floors left out are hidden in the stack (no skip marker). An invalid result falls back to every floor. */
+export type StackGrouping = (floors: readonly StackFloorInfo[], buildingId: string) => ReadonlyArray<string | readonly string[]>;
+
+export interface PickResult {
+  /** 'room' a selectable space (default: classrooms); 'space' any other space or a wall (cls 'wall'); 'floor' a slab. */
+  kind: 'room' | 'space' | 'floor';
+  building: string;
+  floor: string;
+  /** Selectable space key ("buildingId/floorId/classNumber" for classrooms). */
+  key?: string;
+  /** Space class: classroom | room | corridor | vertical | restroom | service | wall. */
+  cls?: string;
+  /** The space hit (rooms and spaces; null for walls). */
+  space?: SpaceInfo | null;
+  point: Vector3;
+  distance: number;
+  object: Object3D;
+}
+
+export type IndoorLabelRole = 'room' | 'badge' | 'skip';
+
+/** Label data for an overlay. Objects are reused between calls; read them, do not keep them. */
+export interface IndoorLabel {
+  /** Stable across frames and presentation changes: room:KEY, poi:B/F/n, entrance:B, badge:B/F, skip:B/F1-F2. */
+  readonly id: string;
+  /** World position for the current frame. */
+  readonly position: Vector3;
+  readonly text: string;
+  /** 'room' (room numbers, facilities, entrance), 'badge' (floor summary in the stack), 'skip' (floors without classrooms). */
+  readonly role: IndoorLabelRole;
+  /** room: RoomStatus; facilities 'poi'; 'entrance'; badge 'open' | 'partial' | 'full' (+ ' collapsed' for a run), 'more'; 'skip'. */
+  readonly kind: string;
+  /** Collision order, higher first (entrance 3, rooms 2–2.5 by area, facilities 1). */
+  readonly priority: number;
+  /** 0..1 from the presentation (pixel-density declutter is the overlay's job). */
+  readonly opacity: number;
+  readonly key?: string;
+  readonly floor?: string;
+  /** Badges: that floor's stats. */
+  readonly stats?: FloorStats;
+  /** Badge of a collapsed stack entry: the floors it stands for. */
+  readonly floors?: readonly string[];
+  /** Windowed stack hint (role 'badge', kind 'more', no floor): "下面還有 N 層" / "上面還有 N 層". */
+  readonly more?: 'below' | 'above';
+  /** Host labels (spaceLabel): the space's key, and its density fade. */
+  readonly space?: string;
+  readonly fadeIn?: [number, number];
+}
+
+export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
+  source: CampusSource;
+  buildings?: Record<string, BuildingConfig>;
+  occupancy?: Occupancy<O> | null;
+  /** Storey height for elevation(); default 3.2. */
+  floorHeight?: number;
+  /** Height of 1F's floor; default 0. */
+  groundY?: number;
+  palette?: Partial<IndoorPalette>;
+  /** Materials react to scene fog; default false. */
+  fog?: boolean;
+  /** cast: the focused floor (mode 'floor') casts shadows; default false. receive: default true. */
+  shadows?: { cast?: boolean; receive?: boolean };
+  /** Added to every renderOrder the layer sets (1–3); default 0. */
+  renderOrderBase?: number;
+  /** lonlat sources only: projection reference; default the centre of campus "A". */
+  lonlatOrigin?: { lon: number; lat: number } | (() => { lon: number; lat: number });
+  /** 'floor-missing' when a floor file is absent. Load failures reject load() instead. */
+  onError?: (error: MapError) => void;
+  /** Floors in the stack overview: 'classrooms' (default; floors without classrooms are skipped with a marker), 'all',
+   *  or a grouping function (collapsed runs; evaluated at build time). 'all' and functions allow stackWindow. */
+  stackFloors?: 'classrooms' | 'all' | StackGrouping;
+  /** Stack badge text per entry; null = no badge. Default "4F · 3/10 沒排課", a collapsed run "R1–R3" (`floors` set,
+   *  stats of the drawn floor). Called again on setOccupancy. */
+  badgeText?: (floor: FloorStats & { floors?: readonly string[] }) => string | null;
+  /** Which spaces are selectable (key, pick kind 'room', tint, outline). Default: classrooms. Evaluated at build time. */
+  selectable?: (space: SpaceInfo) => boolean;
+  /** Label per space (once per key); null = none. Replaces the default labels except the 正門 marker. */
+  spaceLabel?: (space: SpaceInfo) => SpaceLabelSpec | null;
+  /** Where stack badges sit along the depth of the overview's left edge: 'middle' (default) or 'near' the camera
+   *  (perspective hosts: the near edge is the leftmost on screen, so badges never overlap the floors). */
+  badgeAnchor?: 'middle' | 'near';
+  /** Override how a space is drawn; return null to keep the default class. 'room' = drawn like a room in the place colour. */
+  spaceClass?: (space: SpaceInfo) => SpaceClass | null;
+  /** Stack hover emphasis (setHoveredFloor). Default null = the classic look (other floors .28, nothing else).
+   *  fade: other floors' fill; outline: accent outline on the hovered floor (default true); lift: rise as a
+   *  fraction of stackGap; the hovered floor's badge kind gets ' hover'. */
+  hoverStyle?: { fade?: number; outline?: boolean; lift?: number } | null;
+}
+
+export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
+  /** Add this to your scene. One child group per loaded building. */
+  readonly object: Group;
+  /** Fetch and build a building (kept, hidden, until shown). Several can be loaded. Rejects on load failure. */
+  load(buildingId: string): Promise<void>;
+  unload(buildingId: string): void;
+  /** Fetch a building's floor data without building geometry. */
+  prefetch(buildingId: string): Promise<void>;
+  isLoaded(buildingId: string): boolean;
+  /** Resolves true when it lands, false when superseded by the next call (or disposed). Rejects for an unknown building / floor. */
+  setPresentation(p: PresentationOptions): Promise<boolean>;
+  readonly presentation: Presentation;
+  /** True while a presentation change is animating. */
+  readonly animating: boolean;
+  /** Advance animations by dt seconds. Returns true while anything still moves (keep rendering). */
+  update(dt: number): boolean;
+  pick(raycaster: Raycaster): PickResult | null;
+  /** Recolours rooms. Returns true when the set of rooms changed and the building was rebuilt (layout kept). */
+  setOccupancy(occupancy: Occupancy<O> | null): boolean;
+  /** Stack: keep this floor solid and fade the others. */
+  setHoveredFloor(floorId: string | null): void;
+  setHovered(key: string | null): void;
+  /** Selection visual: accent outline + slight tint. */
+  setSelected(key: string | null): void;
+  /** 0..1: emissive = colour × k, so status colours stay readable in a dark scene. */
+  setEmissive(k: number): void;
+  /** World boxes in the layout the presentation lands in (stack: the overview floors only). */
+  buildingBox(buildingId: string): Box3 | null;
+  floorBox(buildingId: string, floorId: string): Box3 | null;
+  roomBox(key: string): Box3 | null;
+  /** Bottom to top. */
+  floors(buildingId: string): FloorStats[];
+  /** (storey index − index of 1F) × floorHeight + groundY. */
+  elevation(buildingId: string, floorId: string): number | null;
+  /** Ground points [x, z] of what the stack shows (footprint + overview floor hulls), to derive a stack gap. */
+  outlinePoints(buildingId: string): [number, number][];
+  /** Ground outline [x, z] of one floor's slab, in the layer frame ([] when unknown). Add the floor's current y yourself. */
+  floorOutline(buildingId: string, floorId: string): [number, number][];
+  /** The stack overview's entries, bottom to top ([] when not loaded). */
+  stackEntries(buildingId: string): StackEntry[];
+  room(key: string): RoomInfo<O> | null;
+  /** Any drawn space of a loaded building by key (selectable or not). */
+  space(key: string): SpaceInfo | null;
+  /** Every drawn space of a loaded building, one per key (for search). [] when not loaded. */
+  spaces(buildingId: string): SpaceInfo[];
+  /** Labels of the shown building for this frame. */
+  labels(): readonly IndoorLabel[];
+  dispose(): void;
+}
+
+/** No DOM, no renderer, no camera. */
+export function createIndoorLayer<O extends HasStatus = OccupancyRecord>(options: IndoorLayerOptions<O>): IndoorLayer<O>;
+
+// ---------------------------------------------------------------------------------------------
+// Label overlay: DOM labels for any camera (orthographic or perspective).
+// ---------------------------------------------------------------------------------------------
+
+export interface OverlayLabel {
+  id: string;
+  position: Vector3;
+  text: string;
+  /** 'room' and 'campus' labels avoid each other; 'badge' labels get click / hover callbacks. */
+  role: string;
+  kind?: string;
+  priority?: number;
+  opacity: number;
+  floor?: string;
+  /** Fade in between these screen densities [from, to] (px per metre). */
+  fadeIn?: [number, number];
+}
+
+export interface LabelOverlayOptions<L extends OverlayLabel = OverlayLabel> {
+  /** Base class of every label element; default 'label' (styled by the package stylesheet inside .indoor-map). */
+  className?: string;
+  /** Extra classes per label; default defaultLabelClass. Called every frame; cheap and pure. */
+  classFor?: (label: L) => string;
+  onBadgeClick?: (label: L) => void;
+  onBadgeHover?: (label: L | null) => void;
+  collision?: { gap: number; hysteresis: number };
+  /** kind 'poi' labels fade in between these screen densities (px per metre). Default 6 → 8.5. */
+  declutter?: { poiFrom: number; poiTo: number };
+  pixelsPerMetre?: (camera: Camera, world: Vector3, height: number) => number;
+}
+
+export interface LabelOverlay<L extends OverlayLabel = OverlayLabel> {
+  /** Every frame, after the camera moved: diff the elements, project, declutter, avoid collisions. */
+  update(camera: Camera, labels: readonly L[]): void;
+  /** Create / remove / restyle elements without positioning (e.g. before measuring). */
+  sync(labels: readonly L[]): void;
+  /** Widest label element matching filter, in px. */
+  maxWidth(filter?: (label: L) => boolean): number;
+  element(id: string): HTMLElement | null;
+  clear(): void;
+  dispose(): void;
+}
+
+/** Label elements are appended to `container`, which should be positioned and cover the canvas. */
+export function createLabelOverlay<L extends OverlayLabel = OverlayLabel>(container: HTMLElement, options?: LabelOverlayOptions<L>): LabelOverlay<L>;
+export function defaultLabelClass(label: OverlayLabel): string;

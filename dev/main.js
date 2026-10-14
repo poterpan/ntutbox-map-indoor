@@ -2,7 +2,7 @@
 // legend, period + building pickers, room sheet, campus card), computes occupancy from the course
 // timetable and pushes it into the engine through its public API only.
 import { createIndoorMap, campusCdnSource, campusModelSource } from '../src/index.js';
-import '../src/engine/indoor-map.css';
+import '../src/viewer/indoor-map.css';
 import { parsePeriods, pickTerm, resolveSlot, slotAt, buildOccupancy, summarizeBuildings } from './course-occupancy.js';
 import fixtureRooms from './fixtures/rooms-115-1.json';
 import fixturePeriods from './fixtures/periods-115-1.json';
@@ -16,6 +16,10 @@ const COURSE_SITE = 'https://course.ntutbox.com';
 let view = null;      // last onViewChange payload
 let course = null;    // { rooms, periods, term, source: 'live' | 'fixture' }
 let pinned = null;    // { day, token } picked by the user, or null = follow the clock
+// Dev-only deterministic mode for visual regression (tests/visual): ?fixture=1 forces the bundled course snapshot,
+// ?day=3&period=5 pins weekday + period (so occupancy colours never follow the clock), ?static=1 hides the toast.
+if (params.has('day') || params.has('period')) pinned = { day: Number(params.get('day') ?? 3), token: params.get('period') ?? '3' };
+if (params.has('static')) document.head.append(Object.assign(document.createElement('style'), { textContent: '#toast{display:none!important}' }));
 let slot = null;      // slot the occupancy was computed for
 let occ = { map: new Map(), unplaced: [] };
 let summary = {};
@@ -25,6 +29,7 @@ let summary = {};
 // ---------------------------------------------------------------------------------------------
 async function loadCourse() {
   try {
+    if (params.has('fixture')) throw new Error('?fixture forces the bundled snapshot');
     const manifest = await fetch('/course-data/manifest.json').then(r => (r.ok ? r.json() : Promise.reject(r.status)));
     const term = pickTerm(manifest);
     if (!term) throw new Error('no current term');
@@ -161,6 +166,7 @@ async function loadCampus() {
   return { source, buildings };
 }
 const [campus, courseData] = await Promise.all([loadCampus(), loadCourse()]);
+let lastViewChangeAt = performance.now();
 const BUILDINGS = campus.buildings;
 course = courseData;
 computeOccupancy();
@@ -176,7 +182,7 @@ const map = createIndoorMap(scene, {
   models: params.get('models') === '0' ? null : campusModelSource(),
   onModelsError: e => console.warn('[dev] models', e),
   onModelsLoaded: e => console.info('[dev] models', e),
-  onViewChange: info => { view = info; renderChrome(); },
+  onViewChange: info => { view = info; lastViewChangeAt = performance.now(); renderChrome(); },
   onRoomSelect: showRoomSheet,
   onCampusFocus: showCampusCard,
   onNotice: showToast,
@@ -187,6 +193,22 @@ const map = createIndoorMap(scene, {
   },
 });
 window.__map = map; // for manual poking in devtools
+// Resolves when the map looks idle: the engine has no public "flying" flag, so this waits for the map to be ready, then
+// for a quiet period with no onViewChange and an unchanged getView(), plus a fixed margin for the 650 ms flight tween and
+// opacity fades (src/viewer/indoor-map.js FOCUS_LAYOUT.durationMs, the layer fades in src/layer/indoor-layer.js). Pixel stability is re-checked by the capture script.
+window.__settled = async ({ quietMs = 900, timeoutMs = 15000 } = {}) => {
+  await map.ready;
+  const t0 = performance.now();
+  let sig = JSON.stringify(map.getView());
+  let stableSince = performance.now();
+  while (performance.now() - t0 < timeoutMs) {
+    await new Promise(r => setTimeout(r, 100));
+    const now = performance.now(), cur = JSON.stringify(map.getView());
+    if (cur !== sig) { sig = cur; stableSince = now; }
+    if (now - Math.max(stableSince, lastViewChangeAt) >= quietMs) return map.getView();
+  }
+  throw new Error('__settled timeout');
+};
 
 recompute(); // fills the chrome (time chip, data source) from the occupancy already given to the map
 if (course.source === 'fixture') showToast('連不到排課站，使用離線課表快照');

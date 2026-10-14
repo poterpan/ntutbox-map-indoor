@@ -1,47 +1,24 @@
 import * as THREE from 'three';
 import { campusCdnSource } from '../data/sources.js';
+import { allCoords, createProjector, geoBounds } from '../data/frame.js';
+import { DEFAULT_BUILDINGS, loadCampus, toOccupancyMap } from '../data/indoor.js';
+import { createIndoorLayer } from '../layer/indoor-layer.js';
+import { centroidOfGeometry, extrudeUp, materialPair, ringsFromGeometry, shapeFromRings } from '../layer/geometry.js';
+import { createLabelOverlay, defaultLabelClass } from '../overlay/label-overlay.js';
 
-// Indoor map engine. One instance per container:
+// Standalone indoor map viewer. One instance per container:
 //   const map = createIndoorMap(el, { source, buildings, onViewChange, onRoomSelect, … });
 //   source: src/data/sources.js. Defaults to the published campus data (campusCdnSource).
 //   map.setOccupancy(…); map.setView({ building, view, floor }); map.destroy();
-// The engine owns the canvas, in-canvas labels, the floor rail and the compass. Everything else (titles,
-// legend, building picker, room sheet, campus card) belongs to the host and is driven by callbacks.
-// The reasoning behind the interaction model and its constants is in docs/DESIGN.md.
+// The viewer owns the renderer, the orthographic camera rig, gestures, the floor rail, the compass, lights
+// and the campus white model. The indoor floors are an IndoorLayer (src/layer) and the in-canvas labels a
+// label overlay (src/overlay); the viewer only decides what they present. Everything else (titles, legend,
+// building picker, room sheet, campus card) belongs to the host and is driven by callbacks.
+// The reasoning behind the interaction model and its constants is in docs/DESIGN.md; the split in docs/LAYER.md.
 
-// Buildings with indoor data. Floor order comes from the source's building index.
-// Hosts pass their own table through `options.buildings`, normally `(await source.load()).buildings`
-// (every building with indoor GIS); this fallback only covers three buildings. The floor that opens first is not
-// configured: it is the floor with the most rooms free per the timetable (defaultFloorId).
-const DEFAULT_BUILDINGS = {
-  A3T: { name: '第三教學大樓', short: '三教', entranceBearing: 0 },
-  AM: { name: '先鋒國際研發大樓', short: '先鋒', entranceBearing: 0 },
-  CB: { name: '綜合科館', short: '綜科', entranceBearing: 270 },
-};
-// `entranceBearing`: compass side of the main entrance (0 = north, 90 = east, …), confirmed on site
-// (2026-10). Every view is oriented as if standing at that entrance looking in: the entrance side is
-// at the bottom of the screen. Exact entrance points (several per building) belong to the future
-// navigation graph, not here.
-// Which GIS spaces are rooms with an occupancy colour:
-//   1. any space whose (building, floor, classNumber) has an occupancy record from the host — the course
-//      system is the source of truth for "is a classroom" (CB has 26 course rooms that GIS files as labs
-//      or meeting rooms);
-//   2. otherwise GIS 001 一般教室 / 002 專業教室, shown as 'unknown' (無課表資料).
-const CLASSROOM_CATEGORIES = new Set(['001', '002']);
-// Occupancy statuses the engine can draw. Time logic lives in the host (example: dev/course-occupancy.js).
-export const ROOM_STATUSES = ['free', 'soon', 'busy', 'unknown'];
-
-// Physical floor order: B2 < B1 < B1M (mezzanine) < 1F < 1M < 2F < … < RF/R1 < PH.
-// building-index lists B1M last; A6T has "1M"; some buildings use "RF".
-export function floorRank(id) {
-  let m;
-  if ((m = /^B(\d+)(M?)$/.exec(id))) return -Number(m[1]) + (m[2] ? .5 : 0);
-  if ((m = /^(\d+)F?(M?)$/.exec(id))) return Number(m[1]) + (m[2] ? .5 : 0);
-  if (id === 'RF') return 1000;
-  if ((m = /^R(\d+)$/.exec(id))) return 1000 + Number(m[1]);
-  if (id === 'PH') return 1100;
-  return 500;
-}
+// Campus <-> building flight: the selected white block dissolves while its floors appear at their real
+// heights (`CAMPUS_FLOOR_HEIGHT` per storey) and then spread into the overview stack.
+const CAMPUS_FLOOR_HEIGHT = 3.2;
 
 export function createIndoorMap(container, options = {}) {
 const opts = {
@@ -72,34 +49,11 @@ const on = (target, type, fn, o = {}) => target.addEventListener(type, fn, { ...
 let destroyed = false, started = false, rafId = 0;
 
 let buildingId = BUILDINGS[opts.initialBuilding] ? opts.initialBuilding : Object.keys(BUILDINGS)[0];
-let STACK_ORDER = [];  // bottom -> top
-let FLOOR_ORDER = [];  // top -> bottom (floor rail)
 
+// Campus white model and stage colours; the indoor palette lives in the layer (src/layer/geometry.js).
 const COLORS = {
   bg: 0xf0f2f6,
   ground: 0xe7eaf0,
-  slabTop: 0xf8f8f7,
-  slabSide: 0xd9dde4,
-  room: 0xd2d6dd,
-  roomSide: 0xbac0c9,
-  free: 0x93dca4,
-  freeSide: 0x58bc72,
-  soon: 0xe8d27d,
-  soonSide: 0xc6a744,
-  unknown: 0xe6e8ec,
-  unknownSide: 0xccd0d7,
-  corridor: 0xf2ecdf,
-  corridorSide: 0xd9cdb8,
-  vertical: 0xc9dcef,
-  verticalSide: 0x9cbad7,
-  restroom: 0xdad6ee,
-  restroomSide: 0xb2abd4,
-  service: 0xe7e9ed,
-  serviceSide: 0xc9cdd5,
-  wall: 0xf6f7f9,
-  wallSide: 0xbfc5ce,
-  outline: 0x767c87,
-  focusEdge: 0x4f5560,
   campus: 0xf8f8f8,
   campusSide: 0xd9dee6,
   selected: 0x9fc7f5,
@@ -109,7 +63,7 @@ const COLORS = {
 // The engine draws into its own element filling the host container, so it never changes the host's
 // classes or styles (the host keeps whatever position / size it gave the container).
 const root = document.createElement('div');
-root.className = 'indoor-map'; // styles: src/engine/indoor-map.css (imported by the host)
+root.className = 'indoor-map'; // styles: src/viewer/indoor-map.css (imported by the host)
 container.appendChild(root);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(COLORS.bg);
@@ -136,10 +90,29 @@ compassEl.className = 'compass hidden';
 compassEl.setAttribute('aria-label', '指北針，點一下轉回正門方向');
 compassEl.innerHTML = '<span class="dial"><i>▲</i><b>N</b></span>';
 root.appendChild(compassEl);
+// In-canvas labels: the layer's room / floor labels plus the campus building names.
+let hoverFloor = null, readyFloor = null;
+const overlay = createLabelOverlay(root, {
+  classFor: l => {
+    let c = defaultLabelClass(l);
+    if (l.role === 'badge' && hoverFloor && l.floor === hoverFloor) c += ' hover';
+    if (l.role === 'badge' && readyFloor === l.floor) c += ' ready';
+    return c;
+  },
+  onBadgeClick: l => { if (currentView === 'stacked') showFloor(l.floor); },
+  onBadgeHover: l => setStackHover(l ? l.floor : null),
+});
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0xaeb7c4, 2.15));
+
+// World frame (shared with the campus 3D map): Y-up metres, x = E − 302800, y = height, z = −(N − 2770400).
+// North is −Z. Planar-cm sources are already relative to that origin (see project()).
+const hemi = new THREE.HemisphereLight(0xffffff, 0xaeb7c4, 2.15);
+// The sky colour has always come from the north (the default +Y of the former Z-up frame); kept as-is so
+// the frame change is pixel-identical.
+hemi.position.set(0, 0, -1);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 2.6);
-sun.position.set(45, -35, 80);
+sun.position.set(45, 80, 35);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.left = -130;
@@ -148,31 +121,40 @@ sun.shadow.camera.top = 130;
 sun.shadow.camera.bottom = -130;
 sun.shadow.camera.near = 1;
 sun.shadow.camera.far = 300;
+// Shadow-map texel grid oriented north-up, as before the frame change.
+sun.shadow.camera.up.set(0, 0, -1);
 scene.add(sun);
 
 scene.add(sun.target);
 
-// The whole building (every floor, fully detailed) is built once into buildingGroup. Moving between
-// the floor overview and a single floor only animates the camera and per-floor opacity.
-const buildingGroup = new THREE.Group();
+// Source coordinates → ground [x, z]. A lonlat source has no published origin; it is projected around a
+// fixed reference (the campus centre, set once in start()).
+let LONLAT_REF = null;
+const project = createProjector(FRAME, () => LONLAT_REF);
+
+// The indoor floors of the current building: built once per building by the layer. Moving between the
+// floor overview and a single floor is a layer presentation change plus a camera flight.
+const layer = createIndoorLayer({
+  source,
+  buildings: BUILDINGS,
+  occupancy: opts.occupancy,
+  floorHeight: CAMPUS_FLOOR_HEIGHT,
+  groundY: 0,
+  shadows: { cast: true, receive: true },
+  lonlatOrigin: () => LONLAT_REF,
+  onError: e => emit('onError', e),
+});
 const campusGroup = new THREE.Group();
-scene.add(buildingGroup, campusGroup);
+scene.add(layer.object, campusGroup);
 
 let buildingIndex;
 let buildingsData;
-let buildingFeature;
 let currentFloor = null;
 let currentView = 'stacked'; // 'stacked' (floor overview) | 'floor3d' (single floor) | 'campus'
 // Where the map opens: the floor overview answers "which floor has room" before anything else.
 const ENTRY_VIEW = { campus: 'campus', overview: 'stacked', floor: 'floor3d' }[opts.initialView] || 'stacked';
-let clickTargets = [];
-let labels = [];
+let clickTargets = []; // campus white-model blocks (the building views pick through the layer)
 let selectedRoom = null;
-// Host-provided occupancy: Map<"B/F/classNumber", { status, …record }>. Records whose key has no
-// classNumber ("B/F/?code") are rooms the course system places on a floor but GIS cannot locate; they
-// still count in that floor's stats.
-let occupancy = toOccupancyMap(opts.occupancy);
-let builtRoomSig = null;
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -206,71 +188,6 @@ const viewState = {
   lastY: 0,
 };
 
-function allCoords(geometry) {
-  const out = [];
-  const walk = value => {
-    if (Array.isArray(value) && value.length >= 2 && typeof value[0] === 'number') out.push(value);
-    else if (Array.isArray(value)) value.forEach(walk);
-  };
-  walk(geometry.coordinates);
-  return out;
-}
-
-function geoBounds(features) {
-  const pts = features.flatMap(f => allCoords(f.geometry));
-  const minLon = Math.min(...pts.map(p => p[0]));
-  const maxLon = Math.max(...pts.map(p => p[0]));
-  const minLat = Math.min(...pts.map(p => p[1]));
-  const maxLat = Math.max(...pts.map(p => p[1]));
-  return { minLon, maxLon, minLat, maxLat, lon: (minLon + maxLon) / 2, lat: (minLat + maxLat) / 2 };
-}
-
-function metersFromLonLat(lon, lat, originLon, originLat) {
-  const R = 6378137;
-  return [
-    (lon - originLon) * Math.PI / 180 * R * Math.cos(originLat * Math.PI / 180),
-    (lat - originLat) * Math.PI / 180 * R,
-  ];
-}
-
-// Source coordinates → local metres around `origin` (the world origin, in the source's own units).
-function project(pt, origin) {
-  if (FRAME === 'planar-cm') return [(pt[0] - origin.lon) / 100, (pt[1] - origin.lat) / 100];
-  return metersFromLonLat(pt[0], pt[1], origin.lon, origin.lat);
-}
-
-function ringsFromGeometry(geometry) {
-  if (geometry.type === 'Polygon') return [geometry.coordinates];
-  if (geometry.type === 'MultiPolygon') return geometry.coordinates;
-  return [];
-}
-
-function shapeFromRings(rings, origin) {
-  if (!rings?.length || rings[0].length < 3) return null;
-  const makePath = (coords, hole = false) => {
-    const p = hole ? new THREE.Path() : new THREE.Shape();
-    coords.forEach((pt, i) => {
-      const [x, y] = project(pt, origin);
-      if (i === 0) p.moveTo(x, y); else p.lineTo(x, y);
-    });
-    p.closePath();
-    return p;
-  };
-  const shape = makePath(rings[0]);
-  for (let i = 1; i < rings.length; i++) shape.holes.push(makePath(rings[i], true));
-  return shape;
-}
-
-function centroidOfGeometry(geometry, origin) {
-  const pts = allCoords(geometry);
-  let sx = 0, sy = 0;
-  for (const p of pts) {
-    const [x, y] = project(p, origin);
-    sx += x; sy += y;
-  }
-  return new THREE.Vector3(sx / pts.length, sy / pts.length, 0);
-}
-
 function clearGroup(group) {
   while (group.children.length) {
     const obj = group.children.pop();
@@ -285,332 +202,22 @@ function clearGroup(group) {
   }
 }
 
-function roomKey(p) {
-  return `${p.buildingId}/${p.floorId}/${p.classNumber}`;
-}
-function roomStatus(key) {
-  const st = occupancy?.get(key)?.status;
-  return ROOM_STATUSES.includes(st) ? st : 'unknown';
-}
-
-function classifyFeature(p) {
-  const name = (p.name || p.use || '').trim();
-  if (name === '柱子' || (!p.category1 && !name && !p.classNumber)) return 'skip';
-  if (name.includes('挑空') || name.includes('採光井')) return 'void';
-  if (p.classNumber && occupancy?.has(roomKey(p))) return 'classroom';
-  if (CLASSROOM_CATEGORIES.has(p.category1)) return 'classroom';
-  if (p.category1 === '505' || /走道|走廊|穿堂|外廊|大廳/.test(name)) return 'corridor';
-  if (p.category1 === '503' || p.category1 === '504' || /電梯|樓梯/.test(name)) return 'vertical';
-  if (p.category1 === '501' || /廁/.test(name)) return 'restroom';
-  return 'service';
-}
-
-function materialPair(top, side, transparent = false, opacity = 1) {
-  return [
-    new THREE.MeshStandardMaterial({ color: top, roughness: .90, metalness: 0, transparent, opacity }),
-    new THREE.MeshStandardMaterial({ color: side, roughness: .95, metalness: 0, transparent, opacity }),
-  ];
-}
-
-// Low walls: tall enough to read as rooms at the single-floor tilt, low enough not to hide the floor colour.
-const WALL = { base: .18, height: .85, thickness: .14 };
-const LABEL_Z = WALL.base + WALL.height + .2;
-
-function addWallSegment(group, x1, y1, x2, y2, zBase = WALL.base, height = WALL.height, thickness = WALL.thickness) {
-  const dx = x2 - x1, dy = y2 - y1;
-  const len = Math.hypot(dx, dy);
-  if (len < .08) return;
-  const geom = new THREE.BoxGeometry(len, thickness, height);
-  const mat = new THREE.MeshStandardMaterial({ color: COLORS.wallSide, roughness: .95, metalness: 0 });
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.position.set((x1+x2)/2, (y1+y2)/2, zBase + height/2);
-  mesh.rotation.z = Math.atan2(dy, dx);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  group.add(mesh);
-}
-
-// Walls already built on the floor being loaded, as collinear intervals. Adjacent rooms share
-// boundaries, so without this every shared edge would get two overlapping walls.
-let floorWalls = null;
-const WALL_ANGLE_TOL = .05, WALL_OFFSET_TOL = .3, WALL_MIN_LEN = .12;
-
-function subtractInterval(parts, [c0, c1]) {
-  return parts.flatMap(([a, b]) => {
-    if (c1 <= a || c0 >= b) return [[a, b]];
-    return [[a, Math.min(b, c0)], [Math.max(a, c1), b]].filter(([x, y]) => y - x > WALL_MIN_LEN);
-  });
-}
-
-function addDedupedWall(group, ax, ay, bx, by) {
-  if (!floorWalls) { addWallSegment(group, ax, ay, bx, by); return; }
-  let ang = Math.atan2(by - ay, bx - ax);
-  if (ang < 0) ang += Math.PI;
-  if (ang >= Math.PI) ang -= Math.PI;
-  const dx = Math.cos(ang), dy = Math.sin(ang);
-  const off = -ax * dy + ay * dx;
-  const t0 = Math.min(ax * dx + ay * dy, bx * dx + by * dy);
-  const t1 = Math.max(ax * dx + ay * dy, bx * dx + by * dy);
-  let parts = [[t0, t1]];
-  for (const w of floorWalls) {
-    const diff = Math.abs(w.ang - ang);
-    // Angles near 0 and near π are the same line with flipped direction.
-    const flipped = diff > Math.PI / 2;
-    if (Math.min(diff, Math.PI - diff) > WALL_ANGLE_TOL) continue;
-    if (Math.abs((flipped ? -w.off : w.off) - off) > WALL_OFFSET_TOL) continue;
-    parts = subtractInterval(parts, flipped ? [-w.t1, -w.t0] : [w.t0, w.t1]);
-    if (!parts.length) break;
-  }
-  floorWalls.push({ ang, off, t0, t1 });
-  for (const [a, b] of parts) {
-    addWallSegment(group, a * dx - off * dy, a * dy + off * dx, b * dx - off * dy, b * dy + off * dx);
-  }
-}
-
-// Room outlines in the GIS data notch around every column (most 5F edges are < 0.5 m). The floor fill
-// keeps the exact polygon; only the wall outline is cleaned: keep the long edges (each one lies exactly
-// on a GIS edge), merge collinear pieces split by a notch, and re-form corners where neighbours meet.
-const WALL_MIN_EDGE_M = 1.0, WALL_MERGE_ANGLE = .17, WALL_MERGE_OFFSET_M = 1.0, WALL_CORNER_MAX_M = 3;
-
-function cleanWallOutline(ring) {
-  const pts = ring.slice(0, -1);
-  const lines = [];
-  for (let i = 0; i < pts.length; i++) {
-    const a = pts[i], b = pts[(i + 1) % pts.length];
-    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
-    if (len >= WALL_MIN_EDGE_M) lines.push({ a, b, len, dir: [(b[0] - a[0]) / len, (b[1] - a[1]) / len] });
-  }
-  const sameLine = (l, m) => {
-    const dot = l.dir[0] * m.dir[0] + l.dir[1] * m.dir[1];
-    if (dot < Math.cos(WALL_MERGE_ANGLE)) return false;
-    const off = Math.abs((m.a[0] - l.a[0]) * l.dir[1] - (m.a[1] - l.a[1]) * l.dir[0]);
-    return off < WALL_MERGE_OFFSET_M;
-  };
-  // Merge runs of collinear edges (cyclically); the longest piece defines the line.
-  const merged = [];
-  for (const l of lines) {
-    const last = merged[merged.length - 1];
-    if (last && sameLine(last.ref, l)) { last.b = l.b; if (l.len > last.ref.len) last.ref = l; }
-    else merged.push({ a: l.a, b: l.b, ref: l });
-  }
-  if (merged.length > 1 && sameLine(merged[0].ref, merged[merged.length - 1].ref)) {
-    const first = merged.shift(), last = merged[merged.length - 1];
-    last.b = first.b; if (first.ref.len > last.ref.len) last.ref = first.ref;
-  }
-  if (merged.length < 3) return ring;
-  const intersect = (l, m) => {
-    const [p, r] = [l.ref.a, l.ref.dir], [q, t] = [m.ref.a, m.ref.dir];
-    const den = r[0] * t[1] - r[1] * t[0];
-    if (Math.abs(den) < 1e-6) return null;
-    const u = ((q[0] - p[0]) * t[1] - (q[1] - p[1]) * t[0]) / den;
-    return [p[0] + r[0] * u, p[1] + r[1] * u];
-  };
-  const out = [];
-  for (let i = 0; i < merged.length; i++) {
-    const l = merged[i], m = merged[(i + 1) % merged.length];
-    let c = intersect(l, m);
-    // Nearly parallel neighbours intersect absurdly far away (HR 4F/7F produced a 224 km wall). A corner
-    // is only a corner if it lies near both edges' original ends; otherwise join those ends directly.
-    if (c && (Math.hypot(c[0] - l.b[0], c[1] - l.b[1]) > WALL_CORNER_MAX_M || Math.hypot(c[0] - m.a[0], c[1] - m.a[1]) > WALL_CORNER_MAX_M)) c = null;
-    // Parallel neighbours with a real step between them: keep both original endpoints.
-    if (c) out.push(c); else out.push(l.b, m.a);
-  }
-  out.push(out[0]);
-  return out;
-}
-
-function addRoomLowWalls(feature, origin, group) {
-  for (const poly of ringsFromGeometry(feature.geometry)) {
-    const ring = (poly[0] || []).map(pt => project(pt, origin));
-    const outline = cleanWallOutline(ring);
-    for (let i = 0; i < outline.length - 1; i++) {
-      addDedupedWall(group, outline[i][0], outline[i][1], outline[i+1][0], outline[i+1][1]);
-    }
-  }
-}
-
-const STATUS_COLORS = {
-  free: [COLORS.free, COLORS.freeSide],
-  soon: [COLORS.soon, COLORS.soonSide],
-  busy: [COLORS.room, COLORS.roomSide],
-  unknown: [COLORS.unknown, COLORS.unknownSide],
-};
-const LABEL_KIND = { free: 'available', soon: 'soon', busy: 'busy', unknown: 'unknown' };
-
-function styleForFeature(feature, floorId = currentFloor, lowWall = true) {
-  const p = feature.properties;
-  const cls = classifyFeature(p);
-  if (cls === 'classroom') {
-    // Each room keeps its own material pair, so a status change only recolours it (see restyleRooms).
-    const kind = roomStatus(roomKey(p));
-    return { depth: lowWall ? .07 : .22, z: .10, mats: materialPair(...STATUS_COLORS[kind]), kind };
-  }
-  if (cls === 'corridor') return { depth: .035, z: .08, mats: materialPair(COLORS.corridor, COLORS.corridorSide) };
-  if (cls === 'vertical') return { depth: .12, z: .09, mats: materialPair(COLORS.vertical, COLORS.verticalSide) };
-  if (cls === 'restroom') return { depth: .10, z: .09, mats: materialPair(COLORS.restroom, COLORS.restroomSide) };
-  // Opaque: a semi-transparent space would let the faint neighbour floors bleed through the focused floor.
-  if (cls === 'service') return { depth: .065, z: .08, mats: materialPair(COLORS.service, COLORS.serviceSide) };
-  return null;
-}
-
-function addExtrudedFeature(feature, origin, group, { floorId = currentFloor, lowWall = true, zOffset = 0, interactive = true, includeLabels = true, targets = clickTargets, labelSink = labels, labelZ = zOffset } = {}) {
-  const cls = classifyFeature(feature.properties);
-  if (cls === 'skip' || cls === 'void') return;
-  const style = styleForFeature(feature, floorId, lowWall);
-  if (!style) return;
-
-  for (const rings of ringsFromGeometry(feature.geometry)) {
-    const shape = shapeFromRings(rings, origin);
-    if (!shape) continue;
-    const geom = new THREE.ExtrudeGeometry(shape, {
-      depth: style.depth,
-      bevelEnabled: cls !== 'corridor' && !lowWall,
-      bevelSize: cls === 'classroom' ? .04 : .02,
-      bevelThickness: cls === 'classroom' ? .03 : .015,
-      bevelSegments: 1,
-      curveSegments: 2,
-    });
-    const mesh = new THREE.Mesh(geom, style.mats);
-    mesh.position.z = style.z + zOffset;
-    mesh.castShadow = cls === 'classroom' || cls === 'vertical' || cls === 'restroom';
-    mesh.receiveShadow = true;
-    mesh.userData = { feature, cls, kind: style.kind, floorId, key: cls === 'classroom' ? roomKey(feature.properties) : null };
-    group.add(mesh);
-
-    if (cls === 'classroom') {
-      if (interactive) targets.push(mesh);
-      const edge = new THREE.LineSegments(
-        new THREE.EdgesGeometry(geom, 25),
-        new THREE.LineBasicMaterial({ color: COLORS.outline, transparent: true, opacity: .24 })
-      );
-      edge.position.z = style.z + zOffset + .006;
-      group.add(edge);
-      if (lowWall) addRoomLowWalls(feature, origin, groupWithOffset(group, zOffset));
-    } else if (cls === 'service' || cls === 'vertical' || cls === 'restroom') {
-      // Plan-style boundaries between the many neutral spaces; only drawn on the focused floor.
-      const edge = new THREE.LineSegments(
-        new THREE.EdgesGeometry(geom, 25),
-        new THREE.LineBasicMaterial({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false })
-      );
-      edge.position.z = style.z + zOffset + .006;
-      edge.userData.focusStyle = 'space';
-      group.add(edge);
-    }
-  }
-
-  if (includeLabels) addFeatureLabels(feature, origin, floorId, labelZ, labelSink);
-}
-
-// Lightweight wrapper that makes wall helpers place meshes at the current floor offset.
-function groupWithOffset(group, zOffset) {
-  return {
-    add(mesh) {
-      mesh.position.z += zOffset;
-      group.add(mesh);
-    }
-  };
-}
-
-function addFeatureLabels(feature, origin, floorId, zOffset, sink) {
-  const p = feature.properties;
-  const cls = classifyFeature(p);
-  if (cls === 'classroom' && p.classNumber) {
-    const c = centroidOfGeometry(feature.geometry, origin);
-    const key = roomKey(p);
-    const label = { local: c.setZ(LABEL_Z + zOffset), text: p.classNumber, kind: LABEL_KIND[roomStatus(key)], key, role: 'room', floor: floorId, area: p.areaSquareMeters || 0 };
-    // GIS sometimes splits one room into several polygons (CB 4F 414): colour all of them, label once,
-    // on the largest piece.
-    const i = sink.findIndex(l => l.key === key);
-    if (i < 0) sink.push(label);
-    else if (label.area > sink[i].area) sink[i] = label;
-    return;
-  }
-  if (cls === 'vertical' || cls === 'restroom') {
-    const c = centroidOfGeometry(feature.geometry, origin);
-    const name = (p.use || p.name || '');
-    let text = name.includes('電梯') ? '電梯' : name.includes('樓梯') ? '樓梯' : name.includes('廁') ? 'WC' : '';
-    if (text) sink.push({ local: c.setZ(.46 + zOffset), text, kind: 'poi', role: 'room', floor: floorId });
-  }
-}
-
-function getClassrooms(data) {
-  return (data?.features || []).filter(f => classifyFeature(f.properties) === 'classroom' && f.properties.classNumber);
-}
-
-function toOccupancyMap(value) {
-  if (!value) return null;
-  return value instanceof Map ? value : new Map(Object.entries(value));
-}
-
-// Timetable stats of one floor, straight from the occupancy records (so rooms GIS cannot locate still
-// count). total = rooms with a timetable; available = free + soon. Without occupancy the floor's GIS
-// classrooms are counted with nothing available, so the overview still shows them.
-function statsForFloor(data, floorId, bid = buildingId) {
-  if (!occupancy) return { total: getClassrooms(data).length, available: 0, free: 0, unlocated: 0 };
-  const prefix = `${bid}/${floorId}/`;
-  let total = 0, available = 0, free = 0, unlocated = 0;
-  for (const [key, rec] of occupancy) {
-    if (!key.startsWith(prefix)) continue;
-    total++;
-    if (rec.status === 'free' || rec.status === 'soon') available++;
-    if (rec.status === 'free') free++;
-    if (key[prefix.length] === '?') unlocated++;
-  }
-  return { total, available, free, unlocated };
-}
-
-// Which occupancy keys of this building exist decides which spaces are rooms (walls, labels): a change
-// in that set needs a rebuild, a change of statuses only a restyle.
-function roomSignature(bid = buildingId) {
-  if (!occupancy) return '';
-  const prefix = `${bid}/`;
-  return [...occupancy.keys()].filter(k => k.startsWith(prefix)).sort().join('|');
-}
-
-function badgeText(f) {
-  return `${f.id} · ${f.stats.available}/${f.stats.total} 沒排課`;
-}
-
-// Apply new statuses without rebuilding geometry.
-function restyleRooms() {
-  for (const f of floors.values()) {
-    for (const mesh of f.rooms) {
-      const kind = roomStatus(mesh.userData.key);
-      if (kind === mesh.userData.kind) continue;
-      mesh.userData.kind = kind;
-      mesh.material[0].color.setHex(STATUS_COLORS[kind][0]);
-      mesh.material[1].color.setHex(STATUS_COLORS[kind][1]);
-    }
-    for (const l of f.labels) {
-      if (!l.key) continue;
-      l.kind = LABEL_KIND[roomStatus(l.key)];
-      if (l.el) l.el.className = `label ${l.kind}`;
-    }
-    f.stats = statsForFloor(floorDatas[f.id], f.id);
-    f.badge.text = badgeText(f);
-    f.badge.kind = badgeKind(f.stats);
-    if (f.badge.el) { f.badge.el.textContent = f.badge.text; f.badge.el.className = `label ${f.badge.kind}${hoverFloor === f.id ? ' hover' : ''}`; }
-  }
-}
-
+// Host occupancy → layer. A change in the set of rooms rebuilds the building (walls, labels) and puts the
+// view back where it was; a change of statuses only recolours.
 function setOccupancy(value) {
-  occupancy = toOccupancyMap(value);
-  if (!started || !floors.size) return;
-  if (roomSignature() !== builtRoomSig) {
-    // The set of rooms changed (typically: first real data replacing none). Rebuild in place.
+  const rebuilt = layer.setOccupancy(toOccupancyMap(value));
+  if (!started || !layer.isLoaded(buildingId)) return;
+  if (rebuilt) {
     const view = currentView, floor = focusFloor;
-    buildBuilding();
-    if (view === 'floor3d' && floors.has(floor)) showFloor(floor, { animate: false });
+    if (view === 'floor3d' && hasFloor(floor)) showFloor(floor, { animate: false });
     else if (view === 'stacked') showOverview({ animate: false });
-    else { setFadeTargets(); applyFades(true); emit('onViewChange', viewInfo()); }
+    else emit('onViewChange', viewInfo());
   } else {
-    restyleRooms();
     renderFloorRail();
     emit('onViewChange', viewInfo());
   }
   if (selectedRoom) {
-    const mesh = floors.get(selectedRoom.floorId)?.rooms.find(m => m.userData.key === selectedRoom.key);
-    if (mesh) showRoomSheet(mesh); else hideRoomSheet();
+    if (layer.room(selectedRoom.key)) showRoomSheet(selectedRoom.key); else hideRoomSheet();
   }
 }
 
@@ -622,22 +229,12 @@ function setOccupancy(value) {
 // screen-up ground direction is E, seen at tilt t, is only fully visible above the next floor when
 // gap >= E·cot(t); `gapRatio` adds the white space that makes each floor read as its own card.
 // Only floors with classrooms appear in the overview. Runs of floors without classrooms collapse into
-// a marker ("7F–13F 沒有教室") with `skipExtra` of extra gap, so a tall building still fits a phone.
+// a marker ("7F–13F 沒有教室") with `skipExtra` × gap of extra gap, so a tall building still fits a phone.
 // On a single floor every floor spreads back to an even, physical order (accordion-style), so the
 // faint neighbours really are the floors directly above and below.
-const STACK_LAYOUT = { gapRatio: 1.42, slabDepth: .7, skipExtra: .45 };
-// Single floor: the floors directly above and below stay faintly visible for vertical context.
-// Neighbours are filled (`neighborFade`) only while flying in, where they explain "you are entering this
-// floor of the stack". After landing they shrink to a slab outline (`neighborOutline`): on polygonal
-// buildings (CB has courtyards everywhere) filled ghosts showed through every gap and hurt legibility.
-const FOCUS_LAYOUT = { neighborFade: .16, neighborOutline: .4, hoverFade: .28, durationMs: 650 };
-// Seen at the steep overview tilt, full-height walls cover most of the room colour, so walls are
-// squashed in the overview and grow to full height on the focused floor as the camera zooms in.
-const OVERVIEW_WALL_SCALE = .2;
-// Focused floor line work: a darker outer edge separates it from the neighbour outlines (fades in on
-// landing). Per-space boundaries were tried and judged too busy (2026-10-03); `spaceEdges` stays 0 until
-// every space gets low walls for campus navigation.
-const FOCUS_STYLE = { outline: .85, spaceEdges: 0 };
+const STACK_LAYOUT = { gapRatio: 1.42, skipExtra: .45 };
+// Flights between views (camera and layer presentation together).
+const FOCUS_LAYOUT = { durationMs: 650 };
 // Semantic zoom: zooming *in* on the overview enters the floor under the fingers/cursor; zooming *out*
 // past the fitted single floor returns to the overview. Both rubber-band before they trigger.
 // Single floor zoom is relative to the default (overscanned) framing. The free range starts a bit below
@@ -647,9 +244,6 @@ const FOCUS_STYLE = { outline: .85, spaceEdges: 0 };
 // The same idea chains upward: zooming out on the floor overview (`exitScale`) flies back to the campus,
 // and zooming in on a campus building with indoor data flies into its overview.
 const SEMANTIC_ZOOM = { enterScale: 1.32, exitScale: .7, rubber: .45, minMargin: .9, exitRatio: .85, maxZoom: 3.5 };
-// Campus <-> building flight: the selected white block dissolves while its floors appear at their real
-// heights (`CAMPUS_FLOOR_HEIGHT` per storey) and then spread into the overview stack.
-const CAMPUS_FLOOR_HEIGHT = 3.2;
 // Campus is a map: pan / zoom / rotate freely (pitch fixed). Entering a building is tied to how big it
 // is on screen, not to gesture scale, so zooming to explore an area never drops you into a building:
 //   readyFill  – a building with indoor data this large (share of the visible area) is highlighted and
@@ -680,23 +274,18 @@ const CAMPUS_NAV = {
   focusRegion: .3, readyGain: 8, enterGain: 14, anchorMs: 600,
 };
 
-const floorDataCache = {};
-let floorDatas = {};
-let floors = new Map(); // floorId -> { id, index, overviewZ, focusZ, group, slab, stats, rooms, hitMeshes, drawables, walls, labels, badge, mats, casters, fade, fadeTarget }
-let skipMarkers = [];
 let focusFloor = null;
-let hoverFloor = null;
-let builtPortrait = null;
-let overviewHeading = 0; // per building, set by layoutFloors
-let modeBlend = 0; // 0 = overview, 1 = single floor; tweened together with the camera
+let focusY = 0;                // base height of the focused floor in the single-floor layout
+let presentedPortrait = null;  // stage orientation the current stack gap was computed for
+let overviewHeading = 0;       // per building, set by stackParams
 let campusBlend = 0; // 1 = campus white model, 0 = inside a building; tweened with the camera
-// Shared world origin for the campus model and every building, so the camera can fly between them.
-let WORLD_ORIGIN = null;
+let layerFlight = 0, layerFlying = false; // the layer's presentation flight (resolves on landing)
+// Lon/lat bounds of the campus white model, in the source's own units (ground plane extent).
+let campusBounds = null;
 let campusMats = []; // { m, base, kind: 'selected' | 'other' | 'ground', mesh }
 let campusBuildings = new Map(); // indoor buildingId -> { meshes, box, label, modelMats }
 let campusFocus = null; // { id, via: 'tap' | 'zoom' | 'return' } – highlighted building with its card
-let floorDataResolved = {};
-let lastCampusBlend = null, lastFloorVis = null;
+let lastCampusBlend = null;
 let campusLabels = [];
 let campusBuilt = false;
 let frameInfo = null;  // { crs, origin: [E, N] metres } of a planar-cm source
@@ -716,10 +305,18 @@ function floorMinZoom() {
   return (fittedPose?.containZoom ?? 1) * SEMANTIC_ZOOM.minMargin;
 }
 
+// Floors of the current building, bottom to top, with their timetable stats.
+function floorStats() {
+  return layer.floors(buildingId);
+}
+function hasFloor(id) {
+  return !!id && floorStats().some(f => f.id === id);
+}
 function overviewFloorIds() {
-  const withRooms = STACK_ORDER.filter(id => floors.get(id)?.stats.total > 0);
+  const all = floorStats();
+  const withRooms = all.filter(f => f.total > 0).map(f => f.id);
   // A building with no timetabled rooms (行政大樓, 圖書館…) still has an overview: all of its floors.
-  return withRooms.length ? withRooms : STACK_ORDER.filter(id => floors.has(id));
+  return withRooms.length ? withRooms : all.map(f => f.id);
 }
 
 function isPortraitStage() {
@@ -730,291 +327,56 @@ function overviewTilt(portrait = isPortraitStage()) {
   return portrait ? p.portraitTilt : p.tilt;
 }
 
-function convexHull(points) {
-  const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-  const lower = [], upper = [];
-  for (const p of pts) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
-  for (const p of pts.reverse()) { while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
-  return lower.slice(0, -1).concat(upper.slice(0, -1));
-}
-
-// Floor slab outline. The official building footprint is used when the floor fits inside it (A3T);
-// some buildings' footprints do not match their floors (AM basements are much larger), so those floors
-// fall back to the convex hull of their own spaces.
-function slabOutline(data, origin, footprintM) {
-  const fb = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
-  footprintM.forEach(([x, y]) => { fb.minX = Math.min(fb.minX, x); fb.maxX = Math.max(fb.maxX, x); fb.minY = Math.min(fb.minY, y); fb.maxY = Math.max(fb.maxY, y); });
-  const pts = data.features
-    .filter(f => !['skip', 'void'].includes(classifyFeature(f.properties)))
-    .flatMap(f => allCoords(f.geometry))
-    .map(p => project(p, origin));
-  if (!pts.length) return null;
-  const tol = 2;
-  const inside = pts.every(([x, y]) => x >= fb.minX - tol && x <= fb.maxX + tol && y >= fb.minY - tol && y <= fb.maxY + tol);
-  return inside ? null : convexHull(pts);
-}
-
-function addSlab(origin, group, depth, floorId, hull) {
-  const shapes = [];
-  if (hull) {
-    const s = new THREE.Shape();
-    hull.forEach(([x, y], i) => (i ? s.lineTo(x, y) : s.moveTo(x, y)));
-    s.closePath();
-    shapes.push(s);
-  } else if (buildingFeature) {
-    for (const rings of ringsFromGeometry(buildingFeature.geometry)) {
-      const s = shapeFromRings(rings, origin);
-      if (s) { shapes.push(s); break; }
-    }
-  }
-  const shape = shapes[0];
-  if (!shape) return null;
-  const geom = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 });
-  const mesh = new THREE.Mesh(geom, materialPair(COLORS.slabTop, COLORS.slabSide));
-  mesh.position.z = .06 - depth;
-  mesh.receiveShadow = true;
-  mesh.userData = { floorLayer: true, floorId, outlinePoints: shape.getPoints() };
-  group.add(mesh);
-  return mesh;
-}
-
-function badgeKind(stats) {
-  if (stats.available === 0) return 'floor-badge full';
-  return stats.available >= Math.max(3, Math.ceil(stats.total * .55)) ? 'floor-badge open' : 'floor-badge partial';
-}
-
-function floorRunLabel(ids) {
-  return ids.length === 1 ? ids[0] : `${ids[0]}–${ids[ids.length - 1]}`;
-}
-
-function buildBuilding() {
-  builtRoomSig = roomSignature();
-  clearGroup(buildingGroup);
-  floors = new Map();
-  skipMarkers = [];
-  const origin = WORLD_ORIGIN;
-  const footprintM = buildingFeature ? allCoords(buildingFeature.geometry).map(p => project(p, origin)) : [];
-
-  const order = { corridor: 0, service: 1, vertical: 2, restroom: 3, classroom: 4, void: 8, skip: 9 };
-  STACK_ORDER.forEach((id, index) => {
-    const data = floorDatas[id] || { features: [] };
-    const group = new THREE.Group();
-    group.userData.floorId = id;
-    buildingGroup.add(group);
-    const floor = {
-      id, index, group, stats: statsForFloor(data, id), overviewZ: 0, focusZ: 0,
-      rooms: [], hitMeshes: [], drawables: [], walls: [], wallScale: null, labels: [], mats: [], casters: [], fade: 0, fadeTarget: 0,
-      outline: null, outlineFade: 0, outlineTarget: 0,
-    };
-    floor.hull = slabOutline(data, origin, footprintM);
-    floor.slab = addSlab(origin, group, STACK_LAYOUT.slabDepth, id, floor.hull);
-
-    floorWalls = [];
-    data.features
-      .slice()
-      .sort((a, b) => order[classifyFeature(a.properties)] - order[classifyFeature(b.properties)])
-      .forEach(f => addExtrudedFeature(f, origin, group, {
-        floorId: id, lowWall: true, interactive: true, includeLabels: true,
-        targets: floor.rooms, labelSink: floor.labels, labelZ: 0,
-      }));
-    floorWalls = null;
-
-    floor.spaceEdges = [];
-    group.traverse(n => {
-      if (!n.isMesh && !n.isLineSegments) return;
-      floor.drawables.push(n);
-      if (n.userData.focusStyle === 'space') { floor.spaceEdges.push(n); return; }
-      if (n.isMesh) {
-        floor.hitMeshes.push(n);
-        if (n.geometry.type === 'BoxGeometry') floor.walls.push(n);
-        if (n.castShadow) floor.casters.push(n);
-      }
-      // Always transparent so a floor can fade without a shader recompile.
-      for (const m of [].concat(n.material)) { m.transparent = true; floor.mats.push({ m, base: m.opacity }); }
-    });
-    // Outline-only ghost, kept outside the floor group so it can show while the fill is hidden.
-    const outlinePts = floor.slab?.userData.outlinePoints;
-    if (outlinePts?.length) {
-      const line = new THREE.LineLoop(
-        new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, p.y, .08))),
-        new THREE.LineBasicMaterial({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false })
-      );
-      line.renderOrder = 1;
-      line.visible = false;
-      buildingGroup.add(line);
-      floor.outline = line;
-      // Outer edge of the focused floor, above the room fills, below the walls.
-      const edge = new THREE.LineLoop(
-        new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, p.y, .2))),
-        new THREE.LineBasicMaterial({ color: COLORS.focusEdge, transparent: true, opacity: 0, depthWrite: false })
-      );
-      edge.renderOrder = 3;
-      edge.visible = false;
-      group.add(edge);
-      floor.focusEdge = edge;
-    }
-    floors.set(id, floor);
-  });
-
-  // Local bounds per floor, computed once: per-frame code only offsets them by the group's z.
-  for (const f of floors.values()) {
-    f.group.position.z = 0;
-    f.localBox = new THREE.Box3().setFromObject(f.group);
-  }
-  layoutFloors(origin, footprintM);
-  addEntranceMarker(footprintM);
-  rebuildLabels();
-  setFadeTargets();
-  applyFades(true);
-  updateFloorPositions();
-}
-
-// Vertical layout for both modes, plus badge / skip-marker anchors.
-function layoutFloors(origin, footprintM) {
-  builtPortrait = isPortraitStage();
-  const overviewIds = overviewFloorIds();
-  // Extent of everything that is shown in the overview (footprint + hull floors).
-  const pts = [...footprintM, ...overviewIds.flatMap(id => floors.get(id).hull || [])];
+// Stack layout for the overview camera: the floor gap that keeps every floor visible above the next at the
+// overview tilt, and the screen-right ground direction the floor badges line up against.
+function stackParams() {
+  const portrait = presentedPortrait = isPortraitStage();
   // Entrance at the bottom (plan A), plus the overview's slight oblique offset.
   const heading = overviewHeading = entranceHeading() + VIEW_PRESETS.stacked.heading;
-  const up = [-Math.sin(heading), Math.cos(heading)], right = [Math.cos(heading), Math.sin(heading)];
-  const us = pts.map(p => p[0] * up[0] + p[1] * up[1]), rs = pts.map(p => p[0] * right[0] + p[1] * right[1]);
+  // Ground [x, z] directions of screen-up and screen-right (north is −z).
+  const up = [-Math.sin(heading), -Math.cos(heading)], right = [Math.cos(heading), -Math.sin(heading)];
+  const us = layer.outlinePoints(buildingId).map(p => p[0] * up[0] + p[1] * up[1]);
   const uMin = Math.min(...us), uMax = Math.max(...us);
-  const gap = (uMax - uMin) / Math.tan(overviewTilt(builtPortrait)) * STACK_LAYOUT.gapRatio;
-  const rBadge = Math.min(...rs) - 1.2, uMid = (uMin + uMax) / 2;
-  const badgeXY = new THREE.Vector3(right[0] * rBadge + up[0] * uMid, right[1] * rBadge + up[1] * uMid, 0);
+  const gap = (uMax - uMin) / Math.tan(overviewTilt(portrait)) * STACK_LAYOUT.gapRatio;
+  return { gap, right };
+}
 
-  // Single floor: even spacing, anchored so the lowest overview floor stays put.
-  const base = overviewIds.length ? floors.get(overviewIds[0]).index : 0;
-  for (const f of floors.values()) f.focusZ = (f.index - base) * gap;
-  // Campus: real storey heights, 1F on the ground, so the floors fill the white block they replace.
-  const ground = STACK_ORDER.indexOf('1F') >= 0 ? STACK_ORDER.indexOf('1F') : base;
-  for (const f of floors.values()) f.campusZ = (f.index - ground) * CAMPUS_FLOOR_HEIGHT;
+// Single floor: even spacing, anchored so the lowest overview floor stays where it is in the stack.
+function floorFocusY(floorId, gap) {
+  const all = floorStats();
+  const first = overviewFloorIds()[0];
+  const base = first ? all.findIndex(f => f.id === first) : 0;
+  return (all.findIndex(f => f.id === floorId) - base) * gap;
+}
 
-  // Overview: consecutive slots, with extra room where floors without classrooms were skipped.
-  let slot = 0, prev = null;
-  for (const id of overviewIds) {
-    const f = floors.get(id);
-    if (prev) {
-      const skipped = STACK_ORDER.slice(prev.index + 1, f.index);
-      const step = 1 + (skipped.length ? STACK_LAYOUT.skipExtra : 0);
-      if (skipped.length) {
-        skipMarkers.push({
-          local: badgeXY.clone(), between: [prev.id, id],
-          text: `${floorRunLabel(skipped)} 沒有教室`, kind: 'floor-skip', role: 'skip',
-        });
-      }
-      slot += step;
-    }
-    f.overviewZ = slot * gap;
-    prev = f;
+// mode: 'stack' | 'floor' | null (campus: the building leaves).
+function present(mode, floor, animate) {
+  const p = { building: null, animate, duration: FOCUS_LAYOUT.durationMs };
+  if (mode) {
+    const { gap, right } = stackParams();
+    Object.assign(p, { building: buildingId, mode, floor, stackGap: gap, skipExtra: STACK_LAYOUT.skipExtra, screenRight: right, floorGap: gap });
+    if (mode === 'floor') p.focusY = focusY = floorFocusY(floor, gap);
   }
-  // Floors that are hidden in the overview sit squeezed next to their nearest shown floor, so they
-  // grow out of it during the accordion transition.
-  const shown = overviewIds.map(id => floors.get(id));
-  for (const f of floors.values()) {
-    // Floors shown in the overview are already placed; with no timetabled rooms every floor is shown.
-    if (!shown.length || shown.includes(f)) continue;
-    const below = [...shown].reverse().find(s => s.index < f.index);
-    const above = shown.find(s => s.index > f.index);
-    if (below && above) f.overviewZ = below.overviewZ + (above.overviewZ - below.overviewZ) * (f.index - below.index) / (above.index - below.index);
-    else if (below) f.overviewZ = below.overviewZ + (f.index - below.index) * gap * .08;
-    else f.overviewZ = above.overviewZ - (above.index - f.index) * gap * .08;
+  const gen = ++layerFlight;
+  layerFlying = !!animate;
+  layer.setPresentation(p).then(
+    () => { if (gen === layerFlight) layerFlying = false; },
+    err => { if (gen === layerFlight) layerFlying = false; console.error('[indoor-map] presentation failed', err); },
+  );
+}
+
+// Every label drawn by the overlay: the layer's (room numbers, facilities, floor badges, skip markers),
+// then the campus building names.
+function labelList() {
+  const own = layer.labels();
+  if (!campusLabels.length) return own;
+  const out = own.slice();
+  for (const l of campusLabels) {
+    l.kind = campusFocus?.id === l.building ? 'selected-building' : 'building';
+    l.opacity = campusBlend;
+    out.push(l);
   }
-  for (const f of floors.values()) {
-    f.badge = {
-      local: badgeXY.clone(), text: badgeText(f),
-      kind: badgeKind(f.stats), role: 'badge', floor: f.id,
-    };
-  }
-}
-
-// "正門" marker on 1F, just outside the middle of the entrance side of the footprint.
-function addEntranceMarker(footprintM) {
-  const ground = floors.get('1F');
-  if (!ground || !footprintM.length) return;
-  const b = (B().entranceBearing || 0) * Math.PI / 180;
-  const v = [Math.sin(b), Math.cos(b)];
-  const xs = footprintM.map(p => p[0]), ys = footprintM.map(p => p[1]);
-  const c = [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
-  const reach = Math.max(...footprintM.map(p => (p[0] - c[0]) * v[0] + (p[1] - c[1]) * v[1]));
-  ground.labels.push({
-    local: new THREE.Vector3(c[0] + v[0] * (reach + 2), c[1] + v[1] * (reach + 2), .5),
-    text: '正門', kind: 'entrance', role: 'room', floor: '1F',
-  });
-}
-
-function floorZ(f) {
-  const inside = f.overviewZ + (f.focusZ - f.overviewZ) * modeBlend;
-  return inside + ((f.campusZ ?? inside) - inside) * campusBlend;
-}
-
-// Floors appear early in a flight from the campus (as the white block dissolves) and vanish late on the
-// way back.
-function floorVisibility() {
-  return 1 - THREE.MathUtils.smoothstep(campusBlend, .55, .95);
-}
-
-function updateFloorPositions() {
-  for (const f of floors.values()) {
-    f.group.position.z = floorZ(f);
-    if (f.outline) f.outline.position.z = f.group.position.z;
-  }
-}
-
-function rebuildLabels() {
-  labels = [
-    ...[...floors.values()].flatMap(f => [...f.labels, ...(f.stats.total ? [f.badge] : [])]),
-    ...skipMarkers,
-    ...campusLabels,
-  ];
-  refreshLabels();
-}
-
-function setFadeTargets() {
-  const overview = new Set(overviewFloorIds());
-  const focus = floors.get(focusFloor);
-  for (const f of floors.values()) {
-    let t = 0;
-    if (currentView === 'stacked' || currentView === 'campus') t = overview.has(f.id) ? (hoverFloor && hoverFloor !== f.id ? FOCUS_LAYOUT.hoverFade : 1) : 0;
-    const neighbour = currentView === 'floor3d' && focus && Math.abs(f.index - focus.index) === 1;
-    if (currentView === 'floor3d' && focus) t = f.id === focus.id ? 1 : neighbour && isFlying() ? FOCUS_LAYOUT.neighborFade : 0;
-    f.fadeTarget = t;
-    f.outlineTarget = neighbour ? FOCUS_LAYOUT.neighborOutline : 0;
-    // Only the focused floor casts shadows; otherwise upper floors would darken the ones below.
-    const cast = currentView === 'floor3d' && f.id === focusFloor;
-    f.casters.forEach(m => { m.castShadow = cast; });
-    // The focused floor draws last, over the faint neighbours (which do not write depth), so a
-    // neighbour only shows where the focused floor is not: context without muddying the map.
-    const order = cast ? 2 : 1;
-    f.drawables.forEach(n => { n.renderOrder = order; });
-  }
-}
-
-function applyFades(dt) {
-  const vis = floorVisibility();
-  const visChanged = vis !== lastFloorVis;
-  lastFloorVis = vis;
-  for (const f of floors.values()) {
-    if (f.outline && (f.outlineFade !== f.outlineTarget || dt === true || visChanged)) {
-      let o = dt === true ? f.outlineTarget : f.outlineFade + (f.outlineTarget - f.outlineFade) * Math.min(1, dt * 9);
-      if (Math.abs(o - f.outlineTarget) < .003) o = f.outlineTarget;
-      f.outlineFade = o;
-      f.outline.material.opacity = o * vis;
-      f.outline.visible = o * vis > .004;
-    }
-    if (f.fade === f.fadeTarget && dt !== true && !visChanged) continue;
-    let next = dt === true ? f.fadeTarget : f.fade + (f.fadeTarget - f.fade) * Math.min(1, dt * 9);
-    if (Math.abs(next - f.fadeTarget) < .003) next = f.fadeTarget;
-    f.fade = next;
-    const k = next * vis;
-    f.group.visible = k > .004;
-    for (const { m, base } of f.mats) {
-      m.opacity = base * k;
-      m.depthWrite = k > .6; // faint neighbours must not hide the focused floor
-    }
-  }
+  return out;
 }
 
 // Campus white model: everything fades with the flight; the selected building dissolves first.
@@ -1031,56 +393,16 @@ function updateCampusFade() {
   }
 }
 
-function updateWallHeights() {
-  for (const f of floors.values()) {
-    const grow = currentView === 'floor3d' && f.id === focusFloor ? modeBlend : 0;
-    const k = OVERVIEW_WALL_SCALE + (1 - OVERVIEW_WALL_SCALE) * grow;
-    if (f.wallScale !== null && Math.abs(k - f.wallScale) < 1e-3) continue;
-    f.wallScale = k;
-    for (const w of f.walls) { w.scale.z = k; w.position.z = WALL.base + WALL.height * k / 2; }
-  }
-}
-
-function updateFocusStyle() {
-  for (const f of floors.values()) {
-    const k = currentView === 'floor3d' && f.id === focusFloor ? THREE.MathUtils.smoothstep(modeBlend, .5, 1) * f.fade : 0;
-    if (f.focusStyleK !== undefined && Math.abs(k - f.focusStyleK) < 1e-3) continue;
-    f.focusStyleK = k;
-    if (f.focusEdge) { f.focusEdge.material.opacity = FOCUS_STYLE.outline * k; f.focusEdge.visible = k > .004 && FOCUS_STYLE.outline > 0; }
-    for (const e of f.spaceEdges) { e.material.opacity = FOCUS_STYLE.spaceEdges * k; e.visible = k > .004 && FOCUS_STYLE.spaceEdges > 0; }
-  }
-}
-
-function updateClickTargets() {
-  if (currentView === 'campus') return;
-  if (currentView === 'stacked') {
-    clickTargets = overviewFloorIds().flatMap(id => [floors.get(id).slab, ...floors.get(id).rooms].filter(Boolean));
-  } else {
-    // Everything on the focused floor counts as "the building"; a miss means empty space.
-    clickTargets = floors.get(focusFloor)?.hitMeshes || [];
-  }
-}
-
-// Bounding box of a floor as it will be once the layout for `mode` is reached (or right now).
-function floorBoxAt(f, mode) {
-  const z = mode === 'floor3d' ? f.focusZ : mode === 'campus' ? f.campusZ : mode === 'stacked' ? f.overviewZ : f.group.position.z;
-  return f.localBox.clone().translate(new THREE.Vector3(0, 0, z));
-}
-
-function overviewBox() {
-  const box = new THREE.Box3();
-  overviewFloorIds().forEach(id => box.union(floorBoxAt(floors.get(id), 'stacked')));
-  return box;
-}
-
 function badgeWidth() {
-  return Math.max(0, ...[...root.querySelectorAll('.label.floor-badge, .label.floor-skip')].map(el => el.offsetWidth));
+  overlay.sync(labelList());
+  return overlay.maxWidth(l => l.role === 'badge' || l.role === 'skip');
 }
 
 // Keep the shadow-casting light (and its shadow frustum) centred on what is being looked at.
-function aimSun(center, z = 0) {
-  sun.target.position.set(center.x, center.y, z);
-  sun.position.set(center.x + 45, center.y - 35, z + 80);
+// `y`: height of the shadow focus. The light comes from the south-east, high up.
+function aimSun(center, y = 0) {
+  sun.target.position.set(center.x, y, center.z);
+  sun.position.set(center.x + 45, y + 80, center.z + 35);
 }
 
 function showOverview({ animate = true } = {}) {
@@ -1089,103 +411,75 @@ function showOverview({ animate = true } = {}) {
   hoverFloor = null;
   endGesture(true);
   hideRoomSheet();
-  const box = overviewBox();
+  present('stack', null, animate);
+  const box = layer.buildingBox(buildingId);
   aimSun(box.getCenter(new THREE.Vector3()), 0);
-  setFadeTargets();
-  updateClickTargets();
   updateChrome();
   goToPose(computeFit(box, 'stacked', { leftExtra: badgeWidth() + 4 }), animate, { locked: animate });
 }
 
 function showFloor(floorId, { animate = true } = {}) {
-  const floor = floors.get(floorId);
-  if (!floor) return;
+  if (!hasFloor(floorId)) return;
   currentView = 'floor3d';
   focusFloor = currentFloor = floorId;
   hoverFloor = null;
   endGesture(true);
   hideRoomSheet();
-  const box = floorBoxAt(floor, 'floor3d');
-  aimSun(box.getCenter(new THREE.Vector3()), floor.focusZ);
-  setFadeTargets();
-  updateClickTargets();
+  present('floor', floorId, animate);
+  const box = layer.floorBox(buildingId, floorId);
+  aimSun(box.getCenter(new THREE.Vector3()), focusY);
   updateChrome();
   goToPose(computeFit(box, 'floor3d'), animate, { locked: animate });
-  setFadeTargets(); // now that the flight exists, neighbours are filled for its duration
 }
 
 // Hovering (or pressing, on touch) a floor in the overview keeps it solid and fades the others.
 function setStackHover(floorId) {
   if (currentView !== 'stacked' || floorId === hoverFloor) return;
   hoverFloor = floorId;
-  setFadeTargets();
-  labels.forEach(l => l.el?.classList.toggle('hover', l.role === 'badge' && !!floorId && l.floor === floorId));
+  layer.setHoveredFloor(floorId);
   renderer.domElement.style.cursor = floorId ? 'pointer' : '';
 }
 
-function sortedFloorIds(id) {
-  const info = buildingIndex.buildings.find(b => b.buildingId === id);
-  if (!info) throw new Error(`building ${id} is not in building-index.json`);
-  return info.floorIds.slice().sort((a, b) => floorRank(a) - floorRank(b));
-}
-
-// Floor GeoJSON per building, fetched once. Kept as a promise so a background preload and a tap that
-// arrives mid-download share the same request.
-function fetchBuildingFloors(id) {
-  return Promise.all(sortedFloorIds(id).map(floorId => {
-    const key = `${id}/${floorId}`;
-    floorDataCache[key] ??= source.floor(id, floorId)
-      .catch(err => { delete floorDataCache[key]; throw err; }) // allow a retry after a network error
-      .then(d => {
-        if (d) return d;
-        emit('onError', { type: 'floor-missing', building: id, floor: floorId, status: 404 });
-        return { features: [] };
-      })
-      .then(d => (floorDataResolved[key] = d));
-    return floorDataCache[key];
-  }));
-}
-
-async function loadBuildingData(id) {
-  const order = sortedFloorIds(id);
-  const datas = await fetchBuildingFloors(id);
-  STACK_ORDER = order;
-  FLOOR_ORDER = STACK_ORDER.slice().reverse();
-  // A building without an official footprint still works: slabs fall back to each floor's hull.
-  buildingFeature = buildingsData.features.find(f => f.properties.buildingId === id) || null;
-  floorDatas = Object.fromEntries(STACK_ORDER.map((floorId, i) => [floorId, datas[i]]));
-}
-
+let switchGen = 0; // latest switchBuilding call wins: a slower earlier load must not take over afterwards
 async function switchBuilding(id, { view = 'stacked', floor = null } = {}) { // view: 'stacked' | 'floor3d' | 'keep'
   if (!BUILDINGS[id] || destroyed) return;
+  const gen = ++switchGen;
   try {
-    await loadBuildingData(id);
+    await layer.load(id);
   } catch (error) {
-    emit('onError', { type: 'building-load-failed', building: id, error });
+    if (gen === switchGen) emit('onError', { type: 'building-load-failed', building: id, error });
     return;
   }
   if (destroyed) return;
+  if (gen !== switchGen) {
+    // Superseded (tap A, then B while A was still loading): drop A's geometry unless it became current.
+    if (id !== buildingId) layer.unload(id);
+    return;
+  }
+  const previous = buildingId;
   buildingId = id;
+  // One building at a time, as before the layer split: the previous one's geometry is freed (its floor
+  // data stays cached in the layer).
+  if (previous !== id) layer.unload(previous);
   // Campus is rebuilt so the dissolving block is the new building.
   clearGroup(campusGroup); campusLabels = []; campusMats = []; campusBuildings = new Map(); campusBuilt = false; lastCampusBlend = null; campusGen++;
-  if (view !== 'keep') modeBlend = view === 'floor3d' ? 1 : 0;
-  buildBuilding();
   if (view === 'keep') {
     if (currentView === 'campus') { buildCampus(); clickTargets = campusClickTargets(); updateChrome(); }
     return;
   }
-  if (view === 'floor3d') showFloor(floor && floors.has(floor) ? floor : defaultFloorId(), { animate: false });
+  if (view === 'floor3d') showFloor(floor && hasFloor(floor) ? floor : defaultFloorId(), { animate: false });
   else showOverview({ animate: false });
 }
 
 // Floor to open when none is asked for: the one with the most rooms free per the timetable.
 function defaultFloorId() {
   let best = null, bestN = -1;
+  const stats = new Map(floorStats().map(f => [f.id, f]));
   for (const id of overviewFloorIds()) {
-    const n = floors.get(id).stats.available;
+    const n = stats.get(id).available;
     if (n > bestN) { bestN = n; best = id; }
   }
-  return best || STACK_ORDER.find(id => floors.has(id));
+  return best || floorStats()[0]?.id;
 }
 
 // Campus -> building: switch the data if needed, then fly into the overview.
@@ -1217,16 +511,16 @@ function estimateBuildingHeight(id) {
   return Math.max(6, (above.length ? Math.max(...above) : 2) * 3.2);
 }
 
-function createCampusBuilding(feature, origin) {
+function createCampusBuilding(feature) {
   const id = feature.properties.buildingId;
   const selected = id === buildingId; // dissolves into its floors during a flight
   const hasIndoor = !!BUILDINGS[id];
   const entry = hasIndoor ? { meshes: [], box: new THREE.Box3(), label: null } : null;
   const h = estimateBuildingHeight(id);
   for (const rings of ringsFromGeometry(feature.geometry)) {
-    const shape = shapeFromRings(rings, origin);
+    const shape = shapeFromRings(rings, project);
     if (!shape) continue;
-    const geom = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: true, bevelSize: .08, bevelThickness: .08, bevelSegments: 1 });
+    const geom = extrudeUp(shape, { depth: h, bevelEnabled: true, bevelSize: .08, bevelThickness: .08, bevelSegments: 1 });
     const mats = materialPair(COLORS.campus, COLORS.campusSide);
     const mesh = new THREE.Mesh(geom, mats);
     mesh.castShadow = true; mesh.receiveShadow = true;
@@ -1236,13 +530,18 @@ function createCampusBuilding(feature, origin) {
     for (const m of mats) { m.transparent = true; campusMats.push({ m, base: 1, kind: selected ? 'selected' : 'other', mesh }); }
   }
   if (hasIndoor) {
-    const c = centroidOfGeometry(feature.geometry, origin);
+    const c = centroidOfGeometry(feature.geometry, project).setY(h + 1.1);
     const area = Number(feature.properties.buildingAreaSquareMeters) || 0;
-    entry.label = { local: c.setZ(h + 1.1), text: BUILDINGS[id].short || BUILDINGS[id].name, kind: 'building', role: 'campus', building: id, area };
+    // Overlay label (local = position: campus labels are already in world coordinates).
+    entry.label = {
+      id: `campus:${id}`, local: c, position: c, text: BUILDINGS[id].short || BUILDINGS[id].name, kind: 'building', role: 'campus',
+      building: id, area, priority: 2 + Math.min(area, 20000) / 40000, opacity: 0,
+    };
     campusLabels.push(entry.label);
     campusBuildings.set(id, entry);
   }
 }
+
 
 // Campus white model: campus "A" plus indoor buildings close to it (AM sits on campus "C", 180 m from the
 // centre of A). Farther campuses (B dorms and 億光 at 330–410 m, D 隆玉 at 1.1 km) would shrink the main
@@ -1257,9 +556,10 @@ function campusFeatures() {
   const a = buildingsData.features.filter(f => f.properties.campusId === 'A');
   const cs = a.map(centroid);
   const c = [cs.reduce((s, p) => s + p[0], 0) / cs.length, cs.reduce((s, p) => s + p[1], 0) / cs.length];
+  const [cx, cz] = project(c);
   const near = f => {
-    const [x, y] = project(centroid(f), { lon: c[0], lat: c[1] });
-    return Math.hypot(x, y) <= opts.campusRadiusM;
+    const [x, z] = project(centroid(f));
+    return Math.hypot(x - cx, z - cz) <= opts.campusRadiusM;
   };
   return (campusFeatureCache = buildingsData.features.filter(f => f.properties.campusId === 'A' || (BUILDINGS[f.properties.buildingId] && near(f))));
 }
@@ -1270,20 +570,18 @@ function campusClickTargets() {
 
 function buildCampus() {
   const main = campusFeatures();
-  const origin = WORLD_ORIGIN;
-  main.forEach(f => createCampusBuilding(f, origin));
-  const [minX, minY] = project([origin.minLon, origin.minLat], origin);
-  const [maxX, maxY] = project([origin.maxLon, origin.maxLat], origin);
+  main.forEach(f => createCampusBuilding(f));
+  const [x0, z0] = project([campusBounds.minLon, campusBounds.minLat]);
+  const [x1, z1] = project([campusBounds.maxLon, campusBounds.maxLat]);
   const groundMat = new THREE.MeshStandardMaterial({ color: COLORS.ground, roughness: 1, transparent: true });
   campusMats.push({ m: groundMat, base: 1, kind: 'ground' });
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry((maxX - minX) + 35, (maxY - minY) + 35), groundMat);
-  ground.position.set((minX + maxX) / 2, (minY + maxY) / 2, -.08);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(Math.abs(x1 - x0) + 35, Math.abs(z1 - z0) + 35).rotateX(-Math.PI / 2), groundMat);
+  ground.position.set((x0 + x1) / 2, -.08, (z0 + z1) / 2);
   ground.receiveShadow = true;
   campusGroup.add(ground);
   campusBuilt = true;
   campusBox = null;
   lastCampusBlend = null;
-  rebuildLabels();
   applyCampusFocusStyle();
   attachModels(++campusGen);
 }
@@ -1329,8 +627,9 @@ async function attachModels(gen) {
   // Nearest the campus centre first: the middle of the view fills in before the edges.
   const ids = [...new Set(campusFeatures().map(f => f.properties.buildingId))].filter(id => manifest.buildings[id]);
   const dist = id => {
-    const [x, y] = modelPosition(manifest.buildings[id].centroidEN);
-    return Math.hypot(x, y) - (id === campusFocus?.id ? 1e6 : 0);
+    const [x, z] = modelPosition(manifest.buildings[id].centroidEN);
+    const [cx, cz] = campusCenter();
+    return Math.hypot(x - cx, z - cz) - (id === campusFocus?.id ? 1e6 : 0);
   };
   ids.sort((a, b) => dist(a) - dist(b));
   let loaded = 0;
@@ -1354,18 +653,21 @@ async function attachModels(gen) {
   emit('onModelsLoaded', { loaded, failed });
 }
 
-// EPSG:3826 metres → world metres, through the same projection as every footprint.
+// EPSG:3826 metres → world [x, z], through the same projection as every footprint.
 function modelPosition([e, n]) {
-  return project([(e - frameInfo.origin[0]) * 100, (n - frameInfo.origin[1]) * 100], WORLD_ORIGIN);
+  return project([(e - frameInfo.origin[0]) * 100, (n - frameInfo.origin[1]) * 100]);
+}
+// Ground [x, z] of the campus white model's centre.
+function campusCenter() {
+  return project([(campusBounds.minLon + campusBounds.maxLon) / 2, (campusBounds.minLat + campusBounds.maxLat) / 2]);
 }
 
 function placeModel(id, template, entry) {
-  const model = template.clone(true);
-  model.rotation.x = Math.PI / 2; // glTF is Y-up (x east, y up, z south); the engine is Z-up (x east, y north)
+  const model = template.clone(true); // glTF is Y-up (x east, y up, z south), the same frame as the world
   const wrap = new THREE.Group();
   wrap.add(model);
-  const [x, y] = modelPosition(entry.centroidEN);
-  wrap.position.set(x, y, 0);
+  const [x, z] = modelPosition(entry.centroidEN);
+  wrap.position.set(x, 0, z);
   wrap.userData = { model: id };
   const kind = id === buildingId ? 'selected' : 'other';
   const own = new Map(); // shared glTF material -> this building's copy (fades and highlights per building)
@@ -1388,18 +690,18 @@ function placeModel(id, template, entry) {
   campusGroup.add(wrap);
   wrap.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(wrap);
-  const height = Math.max(1, box.max.z);
+  const height = Math.max(1, box.max.y);
   for (const mesh of campusGroup.children) {
     if (mesh.userData.building?.properties.buildingId !== id) continue;
     mesh.visible = false;
-    mesh.scale.z = height / (mesh.userData.height || height);
+    mesh.scale.y = height / (mesh.userData.height || height);
   }
   const indoor = campusBuildings.get(id);
   if (indoor) {
     indoor.box = box;
     indoor.fill1 = undefined; // its screen fill was measured against the white-model box
     indoor.modelMats = modelMats;
-    if (indoor.label) indoor.label.local.setZ(height + 1.1);
+    if (indoor.label) indoor.label.local.setY(height + 1.1);
   }
   lastCampusBlend = null; // apply the current fade to the new materials
   campusBox = null;
@@ -1411,7 +713,7 @@ function setCampusFocus(focus) {
   const same = campusFocus?.id === focus?.id && campusFocus?.via === focus?.via;
   campusFocus = focus;
   // Fetch its floors while the user is still deciding, so entering does not wait on the network.
-  if (focus && !same) { try { fetchBuildingFloors(focus.id).catch(() => {}); } catch { /* not indexed */ } }
+  if (focus && !same) layer.prefetch(focus.id).catch(() => { /* not indexed, or offline: entering reports it */ });
   if (!same) applyCampusFocusStyle();
 }
 
@@ -1427,7 +729,6 @@ function applyCampusFocusStyle() {
       m.emissive.setHex(on ? COLORS.selected : emissive);
       m.emissiveIntensity = on ? .45 : intensity;
     }
-    if (entry.label?.el) entry.label.el.className = `label ${on ? 'selected-building' : 'building'}`;
   }
   updateCampusCard();
 }
@@ -1518,7 +819,7 @@ function updateCampusReadiness() {
   // Enter: only while zooming in, on the building under the zoom centre — or, when the fingers are not on
   // any building (small ones are hard to hit), on the one that is already "ready".
   if (!zoomingIn || !zoomAnchor) return;
-  let id = hitTest(zoomAnchor.x, zoomAnchor.y)?.object.userData.building?.properties.buildingId;
+  let id = hitTest(zoomAnchor.x, zoomAnchor.y)?.building;
   if (!campusBuildings.has(id) && campusFocus?.via === 'zoom') id = campusFocus.id;
   const entry = campusBuildings.get(id);
   if (!entry) return;
@@ -1536,7 +837,7 @@ function showCampus({ animate = true, land = 'building' } = {}) {
   hideRoomSheet();
   const box = new THREE.Box3().setFromObject(campusGroup);
   aimSun(box.getCenter(new THREE.Vector3()), 0);
-  setFadeTargets();
+  present(null, null, animate);
   clickTargets = campusClickTargets();
   updateChrome();
   const fit = computeFit(box, 'campus');
@@ -1547,7 +848,7 @@ function showCampus({ animate = true, land = 'building' } = {}) {
     poseCamera(fitCamera, fit);
     const fill1 = boxScreenFill(entry.box, fitCamera);
     const zoom = THREE.MathUtils.clamp(CAMPUS_NAV.landFill / Math.max(fill1, 1e-3), CAMPUS_NAV.minZoom, CAMPUS_NAV.maxZoom);
-    pose = { ...fit, target: entry.box.getCenter(new THREE.Vector3()).setZ(0), zoom };
+    pose = { ...fit, target: entry.box.getCenter(new THREE.Vector3()).setY(0), zoom };
     setCampusFocus({ id: buildingId, via: 'return' });
   }
   goToPose(pose, animate, { locked: animate });
@@ -1573,10 +874,10 @@ function safeInsets() {
 function poseCamera(cam, pose) {
   const d = pose.distance;
   const sinT = Math.sin(pose.tilt), cosT = Math.cos(pose.tilt);
-  // Ground direction that should read as "up" on screen.
-  const ux = -Math.sin(pose.heading), uy = Math.cos(pose.heading);
-  cam.position.set(pose.target.x - ux * d * sinT, pose.target.y - uy * d * sinT, pose.target.z + d * cosT);
-  cam.up.set(ux, uy, 0);
+  // Ground direction [x, z] that should read as "up" on screen (heading 0 = north = −z).
+  const ux = -Math.sin(pose.heading), uz = -Math.cos(pose.heading);
+  cam.position.set(pose.target.x - ux * d * sinT, pose.target.y + d * cosT, pose.target.z - uz * d * sinT);
+  cam.up.set(ux, 0, uz);
   cam.lookAt(pose.target);
   const aspect = root.clientWidth / Math.max(1, root.clientHeight);
   const h = pose.orthoHeight / pose.zoom;
@@ -1648,7 +949,7 @@ let tween = null;
 // leave the UI in floor mode with the camera still showing the whole building.
 const ignoredPointers = new Set();
 let wheelLocked = false, wheelIdleTimer = null;
-function isFlying() { return !!tween?.locked; }
+function isFlying() { return !!tween?.locked || layerFlying; }
 function cancelTween() { if (tween && !tween.locked) tween = null; }
 function lockInputForFlight() {
   for (const id of pointers.keys()) ignoredPointers.add(id);
@@ -1669,15 +970,14 @@ function goToPose(pose, animate, { locked = false } = {}) {
     tween = null;
     viewState.target.copy(pose.target);
     Object.assign(viewState, { heading: pose.heading, tilt: pose.tilt, orthoHeight: pose.orthoHeight, zoom: pose.zoom ?? 1 });
-    if (pose.blend !== undefined) modeBlend = pose.blend;
     if (pose.campus !== undefined) campusBlend = pose.campus;
     updateCamera();
     debugPanel?.sync();
     return;
   }
   tween = {
-    from: { target: viewState.target.clone(), heading: viewState.heading, tilt: viewState.tilt, orthoHeight: viewState.orthoHeight, zoom: viewState.zoom, blend: modeBlend, campus: campusBlend },
-    to: { ...pose, zoom: pose.zoom ?? 1, blend: pose.blend ?? modeBlend, campus: pose.campus ?? campusBlend },
+    from: { target: viewState.target.clone(), heading: viewState.heading, tilt: viewState.tilt, orthoHeight: viewState.orthoHeight, zoom: viewState.zoom, campus: campusBlend },
+    to: { ...pose, zoom: pose.zoom ?? 1, campus: pose.campus ?? campusBlend },
     t0: performance.now(),
     locked,
   };
@@ -1697,7 +997,6 @@ function stepTween(now) {
   // Zoom feels linear in log space.
   viewState.orthoHeight = Math.exp(lerp(Math.log(from.orthoHeight), Math.log(to.orthoHeight)));
   viewState.zoom = Math.exp(lerp(Math.log(from.zoom), Math.log(to.zoom)));
-  modeBlend = lerp(from.blend, to.blend);
   campusBlend = lerp(from.campus, to.campus);
   updateCamera();
   if (k >= 1) {
@@ -1705,37 +1004,34 @@ function stepTween(now) {
     tween = null;
     viewState.heading = to.heading;
     // A wheel stream still running when the flight lands keeps the lock until it pauses.
-    if (wasFlight) {
-      clearTimeout(wheelIdleTimer); wheelIdleTimer = setTimeout(() => { wheelLocked = false; }, 220);
-      setFadeTargets(); // landed: filled neighbours fade to outlines
-    }
+    if (wasFlight) { clearTimeout(wheelIdleTimer); wheelIdleTimer = setTimeout(() => { wheelLocked = false; }, 220); }
     debugPanel?.sync();
   }
 }
 
 // Re-frame the current view (reset button, resize) without changing what is shown.
 function fitCurrent(animate) {
+  if (currentView !== 'campus' && !layer.isLoaded(buildingId)) return; // still loading: start() frames it
   if (currentView === 'campus') goToPose(computeFit(new THREE.Box3().setFromObject(campusGroup), 'campus'), animate);
-  else if (currentView === 'stacked') goToPose(computeFit(overviewBox(), 'stacked', { leftExtra: badgeWidth() + 4 }), animate);
-  else goToPose(computeFit(floorBoxAt(floors.get(focusFloor), 'floor3d'), 'floor3d'), animate);
+  else if (currentView === 'stacked') goToPose(computeFit(layer.buildingBox(buildingId), 'stacked', { leftExtra: badgeWidth() + 4 }), animate);
+  else goToPose(computeFit(layer.floorBox(buildingId, focusFloor), 'floor3d'), animate);
 }
 
-// Point on the horizontal plane at height z under a screen position (orthographic, so always defined).
-function groundPoint(clientX, clientY, z) {
+// Point on the horizontal plane at height y under a screen position (orthographic, so always defined).
+function groundPoint(clientX, clientY, y) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
   const { origin, direction } = raycaster.ray;
-  if (Math.abs(direction.z) < 1e-6) return null;
-  const t = (z - origin.z) / direction.z;
+  if (Math.abs(direction.y) < 1e-6) return null;
+  const t = (y - origin.y) / direction.y;
   return origin.clone().addScaledVector(direction, t);
 }
 
-function focusPlaneZ() {
+function focusPlaneY() {
   if (currentView === 'campus') return 0;
-  const f = floors.get(focusFloor);
-  return f ? f.group.position.z + .1 : 0;
+  return focusFloor ? focusY + .1 : 0;
 }
 
 function isNavigableView() {
@@ -1744,23 +1040,23 @@ function isNavigableView() {
 
 // Keep the content reachable: the view centre may not leave the floor's footprint / the campus.
 function clampTarget() {
-  const f = currentView === 'campus' ? null : floors.get(focusFloor);
-  if (!f && currentView !== 'campus') return;
-  const box = currentView === 'campus' ? (campusBox ??= new THREE.Box3().setFromObject(campusGroup)) : floorBoxAt(f, 'now');
+  if (currentView !== 'campus' && !focusFloor) return;
+  const box = currentView === 'campus' ? (campusBox ??= new THREE.Box3().setFromObject(campusGroup)) : layer.floorBox(buildingId, focusFloor);
+  if (!box) return;
   viewState.target.x = THREE.MathUtils.clamp(viewState.target.x, box.min.x, box.max.x);
-  viewState.target.y = THREE.MathUtils.clamp(viewState.target.y, box.min.y, box.max.y);
+  viewState.target.z = THREE.MathUtils.clamp(viewState.target.z, box.min.z, box.max.z);
 }
 
 // Change zoom/heading while keeping the floor point under (clientX, clientY) fixed on screen.
 function setViewAnchored(changes, clientX, clientY, anchorWorld = null) {
-  const z = focusPlaneZ();
-  const before = anchorWorld || groundPoint(clientX, clientY, z);
+  const y = focusPlaneY();
+  const before = anchorWorld || groundPoint(clientX, clientY, y);
   Object.assign(viewState, changes);
   updateCamera();
-  const after = groundPoint(clientX, clientY, z);
+  const after = groundPoint(clientX, clientY, y);
   if (before && after) {
     viewState.target.x += before.x - after.x;
-    viewState.target.y += before.y - after.y;
+    viewState.target.z += before.z - after.z;
     clampTarget();
     updateCamera();
   }
@@ -1805,19 +1101,19 @@ const REVEAL_MARGIN_PX = 24;
 // Pan (no zoom or rotation) so the selected room's centre sits in the middle of the visible area.
 // Returns false when there is nothing to reveal, true when it is visible (already, or after the pan).
 function revealSelectedRoom(animate) {
-  const mesh = floors.get(selectedRoom.floorId)?.rooms.find(m => m.userData.key === selectedRoom.key);
-  if (!mesh) return false;
-  const c = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3());
+  const box = layer.roomBox(selectedRoom.key);
+  if (!box) return false;
+  const c = box.getCenter(new THREE.Vector3());
   const r = renderer.domElement.getBoundingClientRect(), inset = cachedInsets;
   const p = c.clone().project(camera);
   const sx = r.left + (p.x + 1) / 2 * r.width, sy = r.top + (1 - p.y) / 2 * r.height;
   const left = r.left + inset.left, right = r.right - inset.right, top = r.top + inset.top, bottom = r.bottom - inset.bottom;
   const m = REVEAL_MARGIN_PX;
   if (sx >= left + m && sx <= right - m && sy >= top + m && sy <= bottom - m) return true;
-  const from = groundPoint(sx, sy, c.z), to = groundPoint((left + right) / 2, (top + bottom) / 2, c.z);
+  const from = groundPoint(sx, sy, c.y), to = groundPoint((left + right) / 2, (top + bottom) / 2, c.y);
   if (!from || !to) return false;
   const target = viewState.target.clone();
-  target.x += from.x - to.x; target.y += from.y - to.y;
+  target.x += from.x - to.x; target.z += from.z - to.z;
   const adjusted = viewState.userAdjusted;
   goToPose({ target, heading: viewState.heading, tilt: viewState.tilt, orthoHeight: viewState.orthoHeight, zoom: viewState.zoom }, animate);
   viewState.userAdjusted = adjusted; // a pan to keep the room in sight is not a reframing
@@ -1839,7 +1135,7 @@ function viewInfo() {
     buildingShort: B()?.short,
     floor: currentView === 'floor3d' ? focusFloor : null,
     // Per-floor timetable stats, bottom to top: { id, total, available, free }.
-    floors: STACK_ORDER.filter(id => floors.has(id)).map(id => ({ id, ...floors.get(id).stats })),
+    floors: floorStats(),
   };
 }
 
@@ -1857,9 +1153,9 @@ function renderFloorRail() {
   all.addEventListener('click', () => showOverview());
   rail.appendChild(all);
   let active = null;
-  for (const floor of FLOOR_ORDER) {
+  for (const stats of floorStats().reverse()) {
+    const floor = stats.id;
     const btn = document.createElement('button');
-    const stats = floors.get(floor)?.stats;
     btn.className = 'floor-button' + (floor === focusFloor ? ' active' : '') + (stats?.total ? '' : ' empty');
     btn.textContent = floor;
     btn.addEventListener('click', () => { if (floor !== focusFloor) showFloor(floor); });
@@ -1887,129 +1183,13 @@ function updateCompass() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Labels
-// ---------------------------------------------------------------------------------------------
-
-function makeLabelElement(label) {
-  const el = document.createElement('div');
-  el.className = `label ${label.kind || ''}`;
-  el.textContent = label.text;
-  if (label.role === 'badge') {
-    el.addEventListener('click', e => {
-      e.stopPropagation();
-      if (currentView === 'stacked') showFloor(label.floor);
-    });
-    el.addEventListener('pointerenter', () => setStackHover(label.floor));
-    el.addEventListener('pointerleave', () => setStackHover(null));
-  }
-  root.appendChild(el);
-  label.el = el;
-}
-function refreshLabels() {
-  root.querySelectorAll('.label').forEach(el => el.remove());
-  labels.forEach(makeLabelElement);
-}
-function refreshLabelsIfNeeded() {
-  if (labels.some(l => !l.el)) refreshLabels();
-}
-
-function labelOpacity(l) {
-  if (l.role === 'campus') return campusBlend;
-  // Overview badges: fade in as the campus fades out, and out again while zooming into a floor.
-  if (l.role === 'badge' || l.role === 'skip') return (1 - modeBlend) * THREE.MathUtils.smoothstep(1 - campusBlend, .5, 1);
-  // Room / POI labels: only the focused floor, fading in as the camera arrives.
-  if (currentView !== 'floor3d' || l.floor !== focusFloor) return 0;
-  const arrive = THREE.MathUtils.smoothstep(modeBlend, .55, 1);
-  // Declutter: when the floor is drawn small (e.g. A3T's long side across a portrait phone), stair / WC
-  // badges would sit on top of room numbers. Room numbers win; facilities come back as you zoom in.
-  if (l.kind === 'poi') return arrive * THREE.MathUtils.smoothstep(pixelsPerMeter(), LABEL_DECLUTTER.poiFrom, LABEL_DECLUTTER.poiTo);
-  return arrive;
-}
-
-const LABEL_DECLUTTER = { poiFrom: 6, poiTo: 8.5 }; // screen px per metre
-function pixelsPerMeter() {
-  return root.clientHeight / (viewState.orthoHeight / viewState.zoom);
-}
-
-const labelWorld = new THREE.Vector3();
-// World position of a label, or null when the floor it belongs to no longer exists (a label must never
-// break the render loop).
-function labelPosition(l) {
-  labelWorld.copy(l.local);
-  if (l.between) {
-    const [a, b] = l.between.map(id => floors.get(id)?.group.position.z);
-    if (a === undefined || b === undefined) return null;
-    labelWorld.z += (a + b) / 2;
-  } else if (l.floor && l.role !== 'campus') {
-    const f = floors.get(l.floor);
-    if (!f) return null;
-    labelWorld.z += f.group.position.z;
-  }
-  return labelWorld;
-}
-
-// Labels on the focused floor avoid each other: the entrance first, then classrooms (larger rooms
-// first), then facilities. A label that would overlap one already placed is hidden until zooming in
-// makes room. A label that is currently hidden needs a few extra pixels to come back (no flicker).
-const LABEL_COLLISION = { gap: 2, hysteresis: 4 };
-function labelPriority(l) {
-  if (l.role === 'campus') return l.kind === 'selected-building' ? 4 : 2 + Math.min(l.area || 0, 20000) / 40000;
-  if (l.kind === 'entrance') return 3;
-  if (l.kind === 'poi') return 1;
-  return 2 + Math.min(l.area || 0, 5000) / 10000;
-}
-
-function updateLabelPositions() {
-  const W = root.clientWidth, H = root.clientHeight;
-  const placed = [];
-  const candidates = [];
-  for (const l of labels) {
-    if (!l.el) continue;
-    const op = labelOpacity(l);
-    if (op < .02) { if (l.el.style.visibility !== 'hidden') l.el.style.visibility = 'hidden'; l.collided = false; continue; }
-    const world = labelPosition(l);
-    const p = world && world.project(camera);
-    if (!p || !(p.z > -1 && p.z < 1)) { l.el.style.visibility = 'hidden'; continue; }
-    l.sx = (p.x * .5 + .5) * W;
-    l.sy = (-p.y * .5 + .5) * H;
-    l.op = op;
-    if (l.role === 'room' || l.role === 'campus') candidates.push(l); else placeLabel(l, false);
-  }
-  candidates.sort((a, b) => labelPriority(b) - labelPriority(a));
-  for (const l of candidates) {
-    if (!l.w) { l.w = l.el.offsetWidth; l.h = l.el.offsetHeight; }
-    const m = LABEL_COLLISION.gap + (l.collided ? LABEL_COLLISION.hysteresis : 0);
-    const r = { x0: l.sx - l.w / 2 - m, x1: l.sx + l.w / 2 + m, y0: l.sy - l.h / 2 - m, y1: l.sy + l.h / 2 + m };
-    l.collided = placed.some(q => r.x0 < q.x1 && r.x1 > q.x0 && r.y0 < q.y1 && r.y1 > q.y0);
-    if (!l.collided) placed.push({ x0: l.sx - l.w / 2, x1: l.sx + l.w / 2, y0: l.sy - l.h / 2, y1: l.sy + l.h / 2 });
-    placeLabel(l, l.collided);
-  }
-}
-
-function placeLabel(l, hidden) {
-  l.el.style.visibility = 'visible';
-  l.el.style.opacity = hidden ? '0' : l.op.toFixed(3);
-  l.el.style.pointerEvents = l.role === 'badge' && l.op > .5 ? 'auto' : 'none';
-  l.el.style.left = `${l.sx}px`;
-  l.el.style.top = `${l.sy}px`;
-}
-
-// ---------------------------------------------------------------------------------------------
 // Room selection (the host renders the sheet)
 // ---------------------------------------------------------------------------------------------
 
-function roomInfo(mesh) {
-  const p = mesh.userData.feature.properties;
-  const floorId = mesh.userData.floorId;
-  const key = `${buildingId}/${floorId}/${p.classNumber}`;
-  return {
-    key, buildingId, buildingName: B().name, floorId, classNumber: p.classNumber,
-    gisName: p.name || p.use || '', status: mesh.userData.kind || 'unknown',
-    occupancy: occupancy?.get(key) || null,
-  };
-}
-function showRoomSheet(mesh) {
-  selectedRoom = roomInfo(mesh);
+function showRoomSheet(key) {
+  const info = layer.room(key);
+  if (!info) return;
+  selectedRoom = info;
   emit('onRoomSelect', selectedRoom);
 }
 function isSheetOpen() {
@@ -2033,35 +1213,23 @@ function showToast(text) {
 //                 floor, or tapping empty space, returns to the overview.
 // ---------------------------------------------------------------------------------------------
 
+// What is under a screen point. Campus: { kind: 'campus', building, properties } of a white-model block;
+// building views: the layer's pick ({ kind: 'room' | 'space' | 'floor', floor, key?, … }).
 function hitTest(clientX, clientY) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-  return raycaster.intersectObjects(clickTargets, false)[0];
-}
-
-// Overview floor under a screen point, or the one whose badge is vertically closest.
-function overviewFloorAt(clientX, clientY) {
-  const hit = hitTest(clientX, clientY)?.object.userData.floorId;
-  if (hit) return hit;
-  const rect = root.getBoundingClientRect();
-  let best = null, bestD = Infinity;
-  for (const id of overviewFloorIds()) {
-    const w = labelPosition(floors.get(id).badge);
-    if (!w) continue;
-    const p = w.project(camera);
-    const y = (-p.y * .5 + .5) * rect.height + rect.top;
-    const d = Math.abs(y - clientY);
-    if (d < bestD) { bestD = d; best = id; }
-  }
-  return best;
+  if (currentView !== 'campus') return layer.pick(raycaster);
+  const hit = raycaster.intersectObjects(clickTargets, false)[0];
+  const properties = hit?.object.userData.building?.properties;
+  return hit ? { kind: 'campus', building: properties?.buildingId, properties, object: hit.object } : null;
 }
 
 function handleTap(clientX, clientY) {
   const hit = hitTest(clientX, clientY);
   if (currentView === 'campus') {
-    const b = hit?.object.userData.building?.properties;
+    const b = hit?.properties;
     if (!b) { setCampusFocus(null); return; }
     if (!BUILDINGS[b.buildingId]) {
       setCampusFocus(null);
@@ -2072,10 +1240,9 @@ function handleTap(clientX, clientY) {
     if (campusFocus?.id === b.buildingId) enterBuildingFromCampus(b.buildingId);
     else setCampusFocus({ id: b.buildingId, via: 'tap' });
   } else if (currentView === 'stacked') {
-    const floorId = hit?.object.userData.floorId;
-    if (floorId) showFloor(floorId);
-  } else if (hit?.object.userData.cls === 'classroom') {
-    showRoomSheet(hit.object);
+    if (hit?.floor) showFloor(hit.floor);
+  } else if (hit?.kind === 'room') {
+    showRoomSheet(hit.key);
   } else if (isSheetOpen()) {
     hideRoomSheet(); // first tap outside a room only dismisses the sheet
   } else if (!hit && opts.tapEmptyToExit) {
@@ -2108,7 +1275,7 @@ function startPinch() {
   gesture = {
     type: 'pinch', moved: true, ...p, dist0: p.dist, angle0: p.angle,
     zoom0: viewState.zoom, heading0: viewState.heading,
-    anchor: isNavigableView() ? groundPoint(p.midX, p.midY, focusPlaneZ()) : null,
+    anchor: isNavigableView() ? groundPoint(p.midX, p.midY, focusPlaneY()) : null,
     lastMidX: p.midX, lastMidY: p.midY,
   };
   cancelTween();
@@ -2192,7 +1359,8 @@ function zoomOverviewAt(zoom, x, y) {
 function clampOverview() {
   if (!fittedPose || currentView !== 'stacked') return;
   cameraAxes();
-  const box = overviewBox();
+  const box = layer.buildingBox(buildingId);
+  if (!box) return;
   let s0 = Infinity, s1 = -Infinity, t0 = Infinity, t1 = -Infinity;
   const v = new THREE.Vector3();
   for (let i = 0; i < 8; i++) {
@@ -2213,9 +1381,9 @@ function clampOverview() {
 
 // Every frame on the overview: light up the floor that is big enough, and enter the floor under the
 // zoom centre once a zoom-in pushes it past enterFill.
-let lastOverviewZoom = null, readyFloor = null;
+let lastOverviewZoom = null;
 function updateOverviewReadiness() {
-  if (currentView !== 'stacked' || isFlying() || modeBlend > .01 || campusBlend > .01) {
+  if (currentView !== 'stacked' || isFlying() || layer.animating || campusBlend > .01) {
     lastOverviewZoom = null;
     if (readyFloor) setReadyFloor(null);
     return;
@@ -2225,7 +1393,7 @@ function updateOverviewReadiness() {
   let ready = null, readyDist = Infinity;
   if (viewState.zoom > 1.01) {
     for (const id of overviewFloorIds()) {
-      const m = boxScreenMetrics(floorBoxAt(floors.get(id), 'now'), camera);
+      const m = boxScreenMetrics(layer.floorBox(buildingId, id), camera);
       if (m.visible >= .6 && m.height >= OVERVIEW_NAV.readyHeight && m.centerDist < readyDist) { ready = id; readyDist = m.centerDist; }
     }
   }
@@ -2233,21 +1401,18 @@ function updateOverviewReadiness() {
   if (!zoomingIn || !zoomAnchor) return;
   // The floor under the zoom centre; pinching between floors or beside the stack falls back to the floor
   // that takes the most of the view.
-  let id = hitTest(zoomAnchor.x, zoomAnchor.y)?.object.userData.floorId;
-  if (!floors.get(id)) {
+  let id = hitTest(zoomAnchor.x, zoomAnchor.y)?.floor;
+  if (!hasFloor(id)) {
     let best = 0;
     for (const fid of overviewFloorIds()) {
-      const h = boxScreenMetrics(floorBoxAt(floors.get(fid), 'now'), camera).height;
+      const h = boxScreenMetrics(layer.floorBox(buildingId, fid), camera).height;
       if (h > best) { best = h; id = fid; }
     }
   }
-  const f = floors.get(id);
-  if (f && boxScreenMetrics(floorBoxAt(f, 'now'), camera).height >= OVERVIEW_NAV.enterHeight) showFloor(id);
+  if (hasFloor(id) && boxScreenMetrics(layer.floorBox(buildingId, id), camera).height >= OVERVIEW_NAV.enterHeight) showFloor(id);
 }
 function setReadyFloor(id) {
-  if (id === readyFloor) return;
-  readyFloor = id;
-  for (const f of floors.values()) f.badge?.el?.classList.toggle('ready', f.id === id);
+  readyFloor = id; // the badge lights up through the overlay's classFor
 }
 
 // Single floor: zoom below the fitted size rubber-bands; far enough means "back to the overview".
@@ -2270,7 +1435,7 @@ on(renderer.domElement, 'pointerdown', e => {
     const rotate = e.pointerType === 'mouse' && (e.button === 2 || e.shiftKey || e.altKey);
     gesture = { type: rotate ? 'rotate' : 'pan', moved: false, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY };
     // Touch has no hover: pressing a floor in the overview highlights it.
-    if (currentView === 'stacked' && e.pointerType !== 'mouse') setStackHover(hitTest(e.clientX, e.clientY)?.object.userData.floorId || null);
+    if (currentView === 'stacked' && e.pointerType !== 'mouse') setStackHover(hitTest(e.clientX, e.clientY)?.floor || null);
   } else if (pointers.size === 2) {
     startPinch();
   }
@@ -2282,7 +1447,7 @@ on(renderer.domElement, 'pointermove', e => {
   // A missed pointerup must never leave a drag running on plain hover.
   if (gesture && e.pointerType === 'mouse' && e.buttons === 0) { endGesture(); settleZoom(); }
   if (!gesture) {
-    if (currentView === 'stacked' && !tween && e.pointerType === 'mouse') setStackHover(hitTest(e.clientX, e.clientY)?.object.userData.floorId || null);
+    if (currentView === 'stacked' && !tween && e.pointerType === 'mouse') setStackHover(hitTest(e.clientX, e.clientY)?.floor || null);
     return;
   }
   if (gesture.type === 'pinch') {
@@ -2325,9 +1490,9 @@ on(renderer.domElement, 'pointermove', e => {
       setViewAnchored({ heading: headingAfterRotate(viewState.heading, -dx * .006) }, root.getBoundingClientRect().left + root.clientWidth / 2, root.getBoundingClientRect().top + root.clientHeight / 2);
     } else {
       // Pan: the floor point under the pointer follows it.
-      const z = focusPlaneZ();
-      const a = groundPoint(gesture.lastX, gesture.lastY, z), b = groundPoint(e.clientX, e.clientY, z);
-      if (a && b) { viewState.target.x += a.x - b.x; viewState.target.y += a.y - b.y; clampTarget(); updateCamera(); }
+      const y = focusPlaneY();
+      const a = groundPoint(gesture.lastX, gesture.lastY, y), b = groundPoint(e.clientX, e.clientY, y);
+      if (a && b) { viewState.target.x += a.x - b.x; viewState.target.z += a.z - b.z; clampTarget(); updateCamera(); }
     }
     viewState.userAdjusted = true;
     debugPanel?.sync();
@@ -2393,11 +1558,13 @@ on(window, 'keydown', e => {
 
 on(compassEl, 'click', () => resetHeading());
 
-// Rebuild the building for the current orientation (the overview gap depends on the overview tilt)
-// and put the user back where they were.
-function rebuildBuilding() {
-  buildBuilding();
-  if (currentView !== 'campus') { setFadeTargets(); applyFades(true); updateClickTargets(); fitCurrent(false); }
+// Re-lay out the building for the current orientation (the overview gap depends on the overview tilt)
+// and put the user back where they were. Only positions change; the geometry stays.
+function representForStage() {
+  if (currentView === 'campus') return;
+  if (currentView === 'floor3d') present('floor', focusFloor, false);
+  else present('stack', null, false);
+  fitCurrent(false);
 }
 
 function resize() {
@@ -2406,7 +1573,7 @@ function resize() {
   if (!started) return;
   cachedInsets = safeInsets();
   for (const entry of campusBuildings.values()) entry.fill1 = undefined; // campus framing changed
-  if (currentView !== 'campus' && builtPortrait !== null && builtPortrait !== isPortraitStage()) rebuildBuilding();
+  if (currentView !== 'campus' && presentedPortrait !== null && presentedPortrait !== isPortraitStage()) representForStage();
   // Keep the canonical framing on resize/rotation unless the user has moved the view.
   else if (!viewState.userAdjusted && !tween) fitCurrent(false);
   else updateCamera();
@@ -2418,20 +1585,18 @@ let lastFrame = performance.now();
 function animate(now = performance.now()) {
   if (destroyed) return;
   rafId = requestAnimationFrame(animate);
-  const dt = Math.min(.1, (now - lastFrame) / 1000);
+  const elapsed = Math.max(0, (now - lastFrame) / 1000);
   lastFrame = now;
   stepTween(now);
-  updateFloorPositions();
-  applyFades(dt);
+  // Real elapsed time, so the layer's presentation flight lands with the camera's (which runs on the clock)
+  // even when frames are slow.
+  layer.update(elapsed);
   updateCampusFade();
   updateCampusReadiness();
   updateOverviewReadiness();
   if (currentView === 'campus') updateCampusCard();
-  updateWallHeights();
-  updateFocusStyle();
   updateCompass();
-  refreshLabelsIfNeeded();
-  updateLabelPositions();
+  overlay.update(camera, labelList());
   renderer.render(scene, camera);
 }
 
@@ -2449,7 +1614,7 @@ function setupDebugPanel() {
   const presetOf = () => VIEW_PRESETS[currentView] || VIEW_PRESETS.floor3d;
   const refit = () => fitCurrent(false);
   // Overview geometry (floor gap) depends on its heading/tilt, so those rebuild the building.
-  const overviewApply = () => rebuildBuilding();
+  const overviewApply = () => representForStage();
   // [key, min, max, step, conversion, object getter, apply]
   const fields = () => [
     ['heading', -180, 180, 1, rad, presetOf, currentView === 'stacked' ? overviewApply : refit],
@@ -2463,10 +1628,6 @@ function setupDebugPanel() {
     ] : []),
     ...(currentView === 'floor3d' ? [
       ['overscan', 1, 1.4, .01, raw, presetOf, refit],
-      ['neighborFade', 0, .6, .02, raw, () => FOCUS_LAYOUT, () => setFadeTargets()],
-      ['neighborOutline', 0, 1, .02, raw, () => FOCUS_LAYOUT, () => setFadeTargets()],
-      ['outline', 0, 1, .02, raw, () => FOCUS_STYLE, () => floors.forEach(f => { f.focusStyleK = undefined; })],
-      ['spaceEdges', 0, 1, .02, raw, () => FOCUS_STYLE, () => floors.forEach(f => { f.focusStyleK = undefined; })],
     ] : []),
   ];
   const render = () => {
@@ -2493,19 +1654,22 @@ function setupDebugPanel() {
   };
   debugPanel = { sync };
   // Devtools access to internals, debug mode only.
-  window.__indoorDebug = { scene, renderer, sun, floors: () => floors, overviewBox, floorBoxAt, viewState, camera, boxScreenMetrics, overviewFloorIds, zoomOverviewAt };
+  window.__indoorDebug = { scene, renderer, sun, layer, overlay, viewState, camera, boxScreenMetrics, overviewFloorIds, zoomOverviewAt };
 }
 
 async function start() {
   setupDebugPanel();
   try {
-    ({ buildingIndex, buildingsData, frameInfo = null } = await source.load());
+    ({ buildingIndex, buildingsData, frameInfo = null } = await loadCampus(source));
   } catch (error) {
     emit('onError', { type: 'load-failed', error });
     return;
   }
   if (destroyed) return;
-  WORLD_ORIGIN = geoBounds(campusFeatures());
+  // campusFeatures() projects (radius filter), so a lonlat source needs its reference first.
+  if (FRAME !== 'planar-cm') LONLAT_REF = geoBounds(buildingsData.features.filter(f => f.properties.campusId === 'A'));
+  campusBounds = geoBounds(campusFeatures());
+  if (FRAME !== 'planar-cm') LONLAT_REF = campusBounds;
   renderer.setSize(root.clientWidth, root.clientHeight, false);
   started = true;
   if (ENTRY_VIEW === 'campus') {
@@ -2517,7 +1681,7 @@ async function start() {
   animate();
   for (const id of opts.preload) {
     if (!BUILDINGS[id]) continue;
-    try { fetchBuildingFloors(id).catch(() => {}); } catch { /* not in building-index: skipped */ }
+    layer.prefetch(id).catch(() => { /* not in building-index, or offline: entering reports it */ });
   }
 }
 
@@ -2529,7 +1693,7 @@ function destroy() {
   resizeObserver.disconnect();
   clearTimeout(wheelTimer);
   clearTimeout(wheelIdleTimer);
-  clearGroup(buildingGroup);
+  layer.dispose();
   clearGroup(campusGroup);
   campusGen++;
   for (const p of modelTemplates.values()) p.then(t => t.traverse(n => n.geometry?.dispose?.())).catch(() => {});
@@ -2538,7 +1702,7 @@ function destroy() {
   renderer.domElement.remove();
   railEl.remove();
   compassEl.remove();
-  root.querySelectorAll('.label').forEach(el => el.remove());
+  overlay.dispose();
   debugEl?.remove();
   root.remove();
 }
@@ -2564,7 +1728,7 @@ async function setView({ building = buildingId, view, floor = null, animate = tr
     return !destroyed && buildingId === building;
   }
   if (target === 'campus') { if (currentView !== 'campus') showCampus({ animate }); }
-  else if (target === 'floor3d') showFloor(floor && floors.has(floor) ? floor : defaultFloorId(), { animate });
+  else if (target === 'floor3d') showFloor(floor && hasFloor(floor) ? floor : defaultFloorId(), { animate });
   else if (currentView !== 'stacked') showOverview({ animate });
   return true;
 }
@@ -2576,9 +1740,8 @@ async function selectRoom(key, { animate = true } = {}) {
     const ok = await setView({ building: b, view: 'floor', floor: f, animate: b === buildingId && animate });
     if (!ok || destroyed || focusFloor !== f) return false;
   }
-  const mesh = floors.get(f)?.rooms.find(m => m.userData.key === key);
-  if (!mesh) return false;
-  showRoomSheet(mesh);
+  if (!layer.room(key)) return false;
+  showRoomSheet(key);
   return true;
 }
 return {

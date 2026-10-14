@@ -71,8 +71,46 @@ createIndoorMap(el, { source, buildings, models: campusModelSource(), onModelsLo
 - 模型**不是公開資料**：放在 `models.ntutbox.com`，每個請求要帶宿主網站發的短效 token。`campusModelSource({ tokenUrl })`
   向宿主的 `tokenUrl`（預設 `/api/model-token`）拿 `{ token, expiresAt, base }`，快到期自動換、遇到 401 換一次重試。
   沒有這個端點的網站拿不到模型，地圖就維持白模。
-- 需要 `frame: 'planar-cm'` 的資料來源（`campusCdnSource` 就是）；模型依 EPSG:3826 形心擺放，glTF 的 Y-up 轉成引擎的 Z-up。
+- 需要 `frame: 'planar-cm'` 的資料來源（`campusCdnSource` 就是）；模型依 EPSG:3826 形心擺放，glTF 與引擎同為 Y-up，不旋轉。
 - GLB 用 `KHR_mesh_quantization`，three.js 的 GLTFLoader 原生支援，不需要 WASM 解碼器。GLTFLoader 只在有給 `models` 時才動態載入。
+
+### 嵌入自己的 three.js 場景（IndoorLayer）
+
+宿主已經有自己的 renderer、相機、燈光（例如室外地圖 map.ntutbox.com）時，不用 `createIndoorMap`，
+改用 layer：它只是一個 `THREE.Group` 加上版面與淡入淡出的狀態機，不碰 DOM、renderer、相機。設計見 [docs/LAYER.md](docs/LAYER.md)。
+
+```js
+import { createIndoorLayer, campusCdnSource } from '@ntutbox/map-indoor/layer'; // 無 DOM、無 CSS
+import { createLabelOverlay } from '@ntutbox/map-indoor';                     // 要 DOM 標籤時
+import '@ntutbox/map-indoor/style.css';                                      // 標籤樣式（容器加 class="indoor-map"）
+
+const layer = createIndoorLayer({ source: campusCdnSource(), buildings, occupancy, floorHeight: 3.2, groundY: 0, fog: true, shadows: { cast: true } });
+scene.add(layer.object);                       // 世界座標＝全生態系契約框架（Y-up、公尺、TWD97 原點），不要再變換它
+await layer.load('A3T');
+await layer.setPresentation({ building: 'A3T', mode: 'inplace' });                  // 每層在真實高度
+const landed = await layer.setPresentation({ building: 'A3T', mode: 'stack', stackGap: 12, animate: true }); // true = 落地，false = 被下一次取代
+layer.setPresentation({ building: 'A3T', mode: 'floor', floor: '2F', animate: true });  // 地下樓層預設抬到 groundY
+
+const overlay = createLabelOverlay(labelsEl, { onBadgeClick: l => layer.setPresentation({ building: 'A3T', mode: 'floor', floor: l.floor, animate: true }) });
+function frame(dt) {                            // 按需渲染：update 回傳 true 就繼續要下一幀
+  const moving = layer.update(dt);
+  renderer.render(scene, camera);
+  overlay.update(camera, layer.labels());
+  return moving;
+}
+const hit = layer.pick(raycaster);              // { kind: 'room' | 'space' | 'floor', floor, key?, space? }
+layer.setSelected(hit?.key ?? null);            // 輪廓＋微染
+layer.floorBox('A3T', '2F');                    // 落地版面的世界 Box3，給宿主取景
+```
+
+- `setOccupancy` 只重新上色；教室集合變了才重建該棟（回傳 `true`），版面不變。`setEmissive(k)` 讓夜間場景裡狀態色仍讀得出來。
+- three.js 必須是宿主那一份（peer dependency）；本地連結開發時在 Vite 設 `resolve.dedupe: ['three']`。型別在 `src/index.d.ts`（需要 `@types/three`）。
+- 範例：[`dev/layer.html`](dev/layer.html)＋[`dev/layer.js`](dev/layer.js)（透視相機、自己的燈光與霧、點選教室）。
+- 宿主掛鉤（預設＝排課站行為，不給就像素不變）：`stackFloors: 'all'`（總覽列出所有樓層）或分組函式（連續樓層收成一格「R1–R3」）、
+  `setPresentation({ stackWindow: { start, size } })`（高樓只顯示一段、可捲）、`stackEntries(id)`、`badgeText(floor)`（徽章字，null＝不顯示）、
+  `selectable(space)`（哪些空間能選，預設只有教室）、`spaceLabel(space)`（標籤字／優先序／kind／`fadeIn` 密度淡入）、
+  `spaceClass(space)`（`'room'`＝具名地點，用 `place` 色畫成房間）、`badgeAnchor: 'near'`（透視宿主）。`space(key)`／`spaces(id)` 回傳
+  `SpaceInfo`（type＝CDN `t`、number＝`n`、category＝`c`）。細節在 [docs/LAYER.md](docs/LAYER.md)「宿主掛鉤」。
 
 ## 狀態語意（依課表，不保證沒人）
 
@@ -95,12 +133,13 @@ createIndoorMap(el, { source, buildings, models: campusModelSource(), onModelsLo
 
 ```bash
 npm install
-npm run dev     # 開發頁：http://localhost:5173/（?building=CB&view=floor&debug）
-npm test        # node --test：資料來源、課表轉換、樓層排序
+npm run dev     # 開發頁：http://localhost:3000/（?building=CB&view=floor&debug）；宿主嵌入範例 /dev/layer.html
+npm test        # node --test：資料來源、課表轉換、樓層排序、IndoorLayer（版面、presentation、拾取、上色、釋放）
+npm run visual:capture -- <dir>   # 視覺基準截圖（CAMPUS_DATA=cache，先跑 npm run snapshot:campus）；visual:compare 比對
 ```
 
 開發頁（`index.html` + `dev/`）扮演排課站的角色：節次與大樓選單、教室卡片、校園小卡。
-它透過 Vite proxy 讀 CDN（`/campus-data`、`/course-data`），因為 CDN 的 CORS 不允許 localhost:5173；
+它透過 Vite proxy 讀 CDN（`/campus-data`、`/course-data`），因為 CDN 的 CORS 只允許排課站與 localhost:3000；
 連不到排課站時改用 `dev/fixtures/` 的 115-1 公開課表快照。
 
 發布流程見 [docs/RELEASING.md](docs/RELEASING.md)。
