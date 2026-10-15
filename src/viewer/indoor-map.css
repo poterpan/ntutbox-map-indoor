@@ -7,7 +7,7 @@
 .indoor-map canvas:active { cursor: grabbing; }
 .indoor-map .floor-rail {
   position: absolute; right: 14px; top: 72px; z-index: 5; display: flex; flex-direction: column; gap: 5px;
-  max-height: calc(100% - 170px); overflow-y: auto; padding: 5px; background: rgba(255,255,255,.74);
+  max-height: calc(100% - 170px - var(--im-cover-bottom, 0px)); overflow-y: auto; padding: 5px; background: rgba(255,255,255,.74);
   border-radius: 15px; backdrop-filter: blur(18px);
 }
 .indoor-map .floor-button {
@@ -64,7 +64,7 @@
 .indoor-map .floor-button.all { font-size: 12px; color: var(--im-blue); border-bottom: 1px solid rgba(0,0,0,.06); border-radius: 10px 10px 4px 4px; }
 .indoor-map .label { transition: opacity .12s linear; }
 .indoor-map .compass {
-  position: absolute; right: 16px; bottom: 18px; z-index: 6; width: 44px; height: 44px; border: 0; border-radius: 50%;
+  position: absolute; right: 16px; bottom: calc(18px + var(--im-cover-bottom, 0px)); z-index: 6; width: 44px; height: 44px; border: 0; border-radius: 50%;
   background: rgba(255,255,255,.92); box-shadow: 0 8px 24px rgba(36,44,72,.14); cursor: pointer;
   display: grid; place-items: center; transition: opacity .2s ease;
 }
@@ -93,10 +93,10 @@
 /* Compact chrome: the viewer sets .compact on its root when the container is narrower than 720 px or shorter than
    560 px (course site: the map pane next to the room list, phones). Smaller rail and compass; buttons keep a 28 px
    tap height and never shrink (a long rail scrolls instead of squeezing the buttons); the rail stops above the compass. */
-.indoor-map.compact .floor-rail { right: 10px; top: 60px; gap: 2px; padding: 3px; border-radius: 11px; max-height: calc(100% - 60px - 66px); }
+.indoor-map.compact .floor-rail { right: 10px; top: 60px; gap: 2px; padding: 3px; border-radius: 11px; max-height: calc(100% - 60px - 66px - var(--im-cover-bottom, 0px)); }
 .indoor-map.compact .floor-button { flex: none; min-width: 38px; height: 28px; padding: 0 6px; border-radius: 8px; font-size: 12px; }
 .indoor-map.compact .floor-button.all { font-size: 11px; border-radius: 8px 8px 3px 3px; }
-.indoor-map.compact .compass { right: 12px; bottom: 14px; width: 36px; height: 36px; }
+.indoor-map.compact .compass { right: 12px; bottom: calc(14px + var(--im-cover-bottom, 0px)); width: 36px; height: 36px; }
 .indoor-map.compact .compass .dial { width: 26px; height: 26px; }
 .indoor-map.compact .compass .dial b { font-size: 10px; margin-top: 5px; }
 .indoor-map.compact .compass .dial i { font-size: 9px; }

@@ -863,6 +863,9 @@ function showCampus({ animate = true, land = 'building' } = {}) {
 // reports its own overlays (getInsets); the engine adds its floor rail.
 function safeInsets() {
   const host = (typeof opts.getInsets === 'function' ? opts.getInsets() : opts.insets) || {};
+  // Only a full-width bottom overlay (a phone bottom sheet) lifts the rail and compass; a partial one such as a
+  // legend in a corner keeps them where they are (and the framing avoids it either way).
+  setChromeCover(host.bottomSpansWidth ? host.bottom : 0);
   const inset = { top: host.top ?? 16, right: host.right ?? 16, bottom: host.bottom ?? 16, left: host.left ?? 16 };
   if (railEl.style.display !== 'none' && railEl.children.length) {
     const stage = root.getBoundingClientRect();
@@ -1163,7 +1166,28 @@ function renderFloorRail() {
     if (floor === focusFloor) active = btn;
   }
   // Tall buildings: keep the current floor in view inside the scrollable rail.
-  active?.scrollIntoView({ block: 'nearest' });
+  revealActiveFloor();
+}
+
+// A host overlay across the whole bottom of the map (a phone bottom sheet: getInsets() returns bottomSpansWidth)
+// would cover the floor rail and the compass: both stand on it (CSS --im-cover-bottom) and stay visible.
+let chromeCover = 0;
+function setChromeCover(bottom) {
+  const px = Math.max(0, Math.round(Number(bottom) || 0));
+  if (px === chromeCover) return;
+  chromeCover = px;
+  if (px) root.style.setProperty('--im-cover-bottom', `${px}px`); else root.style.removeProperty('--im-cover-bottom');
+  revealActiveFloor(); // the rail got shorter or taller
+}
+
+// Scroll the rail (only the rail, never the page) so the active floor button is fully visible.
+function revealActiveFloor() {
+  const rail = railEl, btn = rail.querySelector('.floor-button.active');
+  if (!btn || rail.style.display === 'none') return;
+  const top = btn.offsetTop - rail.clientTop, bottom = top + btn.offsetHeight;
+  const pad = 0; // same as scrollIntoView({ block: "nearest" }) (parity), without scrolling the page
+  if (top - pad < rail.scrollTop) rail.scrollTop = Math.max(0, top - pad);
+  else if (bottom + pad > rail.scrollTop + rail.clientHeight) rail.scrollTop = bottom + pad - rail.clientHeight;
 }
 
 function updateCompass() {
