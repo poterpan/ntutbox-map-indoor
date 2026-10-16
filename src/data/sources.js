@@ -11,6 +11,8 @@
 // load() is memoised, so a host can await it for its building list before creating the map and the engine
 // reuses the same result.
 
+import { floorRank } from './indoor.js';
+
 const getJSON = (fetchImpl, url) => fetchImpl(url).then(r => {
   if (!r.ok) throw Object.assign(new Error(`${r.status} ${url}`), { status: r.status });
   return r.json();
@@ -56,6 +58,63 @@ export function campusCdnSource(baseUrl = 'https://cdn.ntutbox.com/campus/v1', {
         floorCache.set(key, p);
       }
       return floorCache.get(key);
+    },
+  };
+}
+
+// Several indoor buildings shown as one: `mergeBuildings(source, { B1D: ['B1D', 'B2D'] })` wraps any source so
+// building B1D has the floors of both (floor lists are the union, in floorRank order) and each floor holds the
+// spaces of every member that has it. The other members leave the building index. Floors are matched by id, so
+// a member's floor sits at the same elevation as the target's floor of that id. Merged features keep their
+// own spaceId (e.g. "B2D/3F/2301", so a host can tell which member a space came from) and get
+// buildingId = the target plus sourceBuildingId = the member. Room keys are "target/floor/number": members
+// with the same room number on the same floor would share a key, so only merge buildings whose numbers differ.
+// The target's footprint gets the members' outlines too (concatenated, so they should not overlap).
+export function mergeBuildings(source, groups) {
+  const members = new Map(Object.entries(groups).map(([target, ids]) => [target, [...new Set([target, ...ids])]]));
+  const absorbed = new Set([...members].flatMap(([target, ids]) => ids.filter(id => id !== target)));
+  let loaded, floorsOf;
+  function load() {
+    loaded ??= Promise.resolve(source.load()).then(data => {
+      floorsOf = new Map(data.buildingIndex.buildings.map(b => [b.buildingId, b.floorIds]));
+      const index = new Map(data.buildingIndex.buildings.map(b => [b.buildingId, b]));
+      const feature = new Map(data.buildingsData.features.map(f => [f.properties.buildingId, f]));
+      const buildings = [];
+      for (const b of data.buildingIndex.buildings) {
+        if (absorbed.has(b.buildingId) && !members.has(b.buildingId)) continue;
+        const ids = members.get(b.buildingId);
+        if (!ids) { buildings.push(b); continue; }
+        const floors = new Set(ids.flatMap(id => index.get(id)?.floorIds ?? []));
+        buildings.push({ ...b, floorIds: [...floors].sort((x, y) => floorRank(x) - floorRank(y)) });
+      }
+      const features = data.buildingsData.features.map(f => {
+        const ids = members.get(f.properties.buildingId);
+        if (!ids) return f;
+        const coordinates = ids.flatMap(id => {
+          const g = feature.get(id)?.geometry;
+          return !g ? [] : g.type === 'Polygon' ? [g.coordinates] : g.coordinates;
+        });
+        return { ...f, geometry: { type: 'MultiPolygon', coordinates } };
+      });
+      return { ...data, buildingIndex: { ...data.buildingIndex, buildings }, buildingsData: { ...data.buildingsData, features } };
+    });
+    loaded.catch(() => { loaded = undefined; });
+    return loaded;
+  }
+  return {
+    ...(source.frame ? { frame: source.frame } : {}),
+    load,
+    async floor(id, floorId) {
+      const ids = members.get(id);
+      if (!ids) return source.floor(id, floorId);
+      await load();
+      const docs = await Promise.all(ids.map(m => (floorsOf.get(m)?.includes(floorId) ? source.floor(m, floorId) : null)));
+      if (docs.every(d => !d)) return null;
+      const features = [];
+      docs.forEach((d, i) => {
+        for (const f of d?.features ?? []) features.push(ids[i] === id ? f : { ...f, properties: { ...f.properties, buildingId: id, sourceBuildingId: ids[i] } });
+      });
+      return { type: 'FeatureCollection', features };
     },
   };
 }

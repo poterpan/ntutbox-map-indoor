@@ -51,6 +51,13 @@ export interface CampusSource {
 
 export const CAMPUS_SCHEMA_VERSION: number;
 export function campusCdnSource(baseUrl?: string, options?: { fetch?: typeof fetch }): CampusSource & { frame: 'planar-cm'; load(): Promise<CdnCampusData> };
+/**
+ * Shows several indoor buildings as one: `mergeBuildings(source, { B1D: ['B1D', 'B2D'] })`. The target's floor
+ * list is the union (floorRank order), each floor holds every member's spaces (matched by floor id), the other
+ * members leave the building index, and the target's footprint gets their outlines. Merged spaces keep their
+ * spaceId and carry `sourceBuildingId`; room keys use the target, so members must not share room numbers on a floor.
+ */
+export function mergeBuildings<S extends CampusSource>(source: S, groups: Record<string, string[]>): CampusSource & { load(): ReturnType<S['load']> };
 export function convertBuildings(doc: unknown): CampusData;
 export function convertFloor(doc: unknown): FeatureCollection<MultiPolygon>;
 

@@ -177,6 +177,17 @@ layer.stackEntries(id): StackEntry[]   // { id（畫出來的那層）, floors, 
 - 多邊形運算用 `@countertype/clipper2-ts`（Clipper2 的 TS 版，BSL-1.0），只有 `slab: 'spaces'` 才動態載入。
   GIS 環有幾 cm² 的細縫洞（A6T B2 有十個），一起裁剪會讓 clipper 卡死：小於 0.1 m² 的環先丟掉。全校 228 層平均每層 1.1 ms（最多 8 ms）。
 
+## 合併建築（0.13，2026-10-16）
+
+`mergeBuildings(source, { B1D: ['B1D', 'B2D'] })` 包住任何資料來源，讓好幾棟室內資料當成一棟（地圖站的一宿＋二宿：
+模型與校園輪廓是一棟，室內資料分兩棟）。不改 layer：
+
+- 目標那棟的樓層清單取聯集（`floorRank` 排序），每層含所有有那層的成員的空間；其他成員從 building index 拿掉。
+- 樓層用 id 對齊，所以成員的同名樓層在同一高度（一宿 R1 會排在二宿 12F 之上，即使實際高度不同）。
+- 併進來的空間保留原本的 `spaceId`（`B2D/3F/2301`，宿主靠它分辨是哪一棟），`buildingId` 改成目標、另加 `sourceBuildingId`。
+  地點鍵是「目標/樓層/房號」：同一層兩棟有同房號會撞鍵，只合併房號不重複的建築。
+- 目標的校園輪廓加上成員的輪廓（直接串接，不做聯集，所以不應重疊）。
+
 ## Overlay API
 
 ```ts
