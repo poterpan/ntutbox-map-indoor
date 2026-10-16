@@ -402,6 +402,13 @@ export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
   spaceClass?: (space: SpaceInfo) => SpaceClass | null;
   /** Low walls around this space (any drawn space). Default: classrooms only. Evaluated at build time. */
   spaceWalls?: (space: SpaceInfo) => boolean;
+  /** Floor slabs. 'footprint' (default): the building footprint, or the hull of a floor that does not fit it.
+   *  'spaces': a floor whose spaces split into separate parts, or cover less than 60 % of that slab, gets one plate
+   *  per part, shaped by the spaces themselves (gaps under 1 m closed, courtyards kept, < 2 m² slivers dropped).
+   *  Loads a small polygon module (~25 KB gzip) on first use. */
+  slab?: 'footprint' | 'spaces';
+  /** slab 'spaces': floors that keep the footprint slab anyway (partial data): "B/F" ids, or a predicate. */
+  slabFootprintFloors?: readonly string[] | ((buildingId: string, floorId: string) => boolean) | null;
   /** Stack hover emphasis (setHoveredFloor). Default null = the classic look (other floors .28, nothing else).
    *  fade: other floors' fill; outline: accent outline on the hovered floor (default true); lift: rise as a
    *  fraction of stackGap; the hovered floor's badge kind gets ' hover'. */
@@ -446,6 +453,8 @@ export interface IndoorLayer<O extends HasStatus = OccupancyRecord> {
   outlinePoints(buildingId: string): [number, number][];
   /** Ground outline [x, z] of one floor's slab, in the layer frame ([] when unknown). Add the floor's current y yourself. */
   floorOutline(buildingId: string, floorId: string): [number, number][];
+  /** Every slab plate's outline [x, z] (several with slab 'spaces'); the first, largest, is floorOutline. */
+  floorOutlines(buildingId: string, floorId: string): [number, number][][];
   /** The stack overview's entries, bottom to top ([] when not loaded). */
   stackEntries(buildingId: string): StackEntry[];
   room(key: string): RoomInfo<O> | null;
