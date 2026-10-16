@@ -29,7 +29,8 @@ const map = createIndoorMap(el, {
   buildings,                                  // { A3T: { name, short, entranceBearing } }；務必傳入，不傳只有內建的 3 棟備援
   occupancy,                                  // Map：'A3T/2F/201' → { status, … }，見下方
   initialBuilding: 'A3T', initialView: 'overview', // 'campus' | 'overview' | 'floor'
-  getInsets: () => ({ top, right, bottom, left }),  // 宿主 UI 蓋住的範圍（px）；變了就呼叫 map.refreshInsets()
+  getInsets: () => ({ top, right, bottom, left, bottomSpansWidth }),  // 宿主 UI 蓋住的範圍（px）；變了就呼叫 map.refreshInsets()
+  // bottomSpansWidth: true＝底部是整條橫跨的面板（手機的底部抽屜）：樓層列與指北針會站到它上面（0.12.2）
   onViewChange, onRoomSelect, onCampusFocus, onError, onLoading, onNotice,
 });
 
@@ -38,6 +39,7 @@ await map.setView({ building: 'CB', view: 'floor', floor: '3F' }); // false = �
 await map.selectRoom('CB/3F/322');                                  // 清單點教室 → 地圖飛過去並選取
 map.enterBuilding('AM'); map.resetView(); map.clearSelection(); map.getView();
 map.refreshInsets();  // 底部面板升起等遮擋改變後：選中的教室被蓋住就平移回可見區，否則重新取景（使用者沒移動過時）
+// 樓層列換層（點、程式、第一次打開）時會把目前那層捲進可見範圍（只捲樓層列，不捲頁面）
 map.destroy();  // 取消 rAF、移除所有 listener、釋放 WebGL context
 ```
 

@@ -9,6 +9,12 @@ import fixturePeriods from './fixtures/periods-115-1.json';
 
 const $ = sel => document.querySelector(sel);
 const params = new URLSearchParams(location.search);
+if (params.get('sheet')) {
+  const m = document.createElement('div');
+  m.id = 'mockSheet';
+  m.style.cssText = `position:absolute;left:0;right:0;bottom:0;height:${Number(params.get('sheet'))}px;z-index:30;background:rgba(255,255,255,.96);border-radius:24px 24px 0 0;box-shadow:0 -8px 24px rgba(0,0,0,.12)`;
+  document.querySelector('#scene').appendChild(m);
+}
 const scene = $('#scene');
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
 const COURSE_SITE = 'https://course.ntutbox.com';
@@ -69,6 +75,9 @@ function getInsets() {
   let top = 16, bottom = 16;
   for (const el of [$('.view-switch'), $('.floor-title')]) if (visible(el)) top = Math.max(top, el.getBoundingClientRect().bottom - r.top + 10);
   for (const el of [$('.legend'), $('#roomSheet')]) if (visible(el)) bottom = Math.max(bottom, r.bottom - el.getBoundingClientRect().top + 10);
+  // ?sheet=<px>: a mock full-width bottom sheet (like the course site's phone panel), for tests/visual/rail.mjs
+  const mock = $('#mockSheet');
+  if (mock) return { top, right: 16, bottom: Math.max(bottom, mock.offsetHeight), left: 16, bottomSpansWidth: true };
   return { top, right: 16, bottom, left: 16 };
 }
 

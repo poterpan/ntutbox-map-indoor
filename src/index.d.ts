@@ -89,7 +89,13 @@ export interface HasStatus { status: RoomStatus }
 /** Keyed "buildingId/floorId/classNumber". */
 export type Occupancy<O extends HasStatus = OccupancyRecord> = Map<string, O> | Record<string, O>;
 
-export interface Insets { top?: number; right?: number; bottom?: number; left?: number }
+export interface Insets {
+  top?: number; right?: number; bottom?: number; left?: number;
+  /** The bottom inset is a full-width overlay (a phone bottom sheet): the floor rail and the compass are lifted
+   *  above it, the rail gets shorter (and scrolls). Default false: a partial overlay (a legend in a corner) only
+   *  affects the framing. Call map.refreshInsets() when it changes. */
+  bottomSpansWidth?: boolean;
+}
 
 export type MapView = 'campus' | 'overview' | 'floor';
 
