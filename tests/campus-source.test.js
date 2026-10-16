@@ -87,3 +87,41 @@ test('campusCdnSource refuses an unknown schema and lets a later load retry', as
   files['current.json'] = published['current.json'];
   assert.equal((await src.load()).current.revision, 3);
 });
+
+test('mergeBuildings: one building with the union of floors and every member\'s spaces', async () => {
+  const { mergeBuildings } = await import('../src/data/sources.js');
+  const sq = (x, s = 100) => [[[x, 0], [x + s, 0], [x + s, s], [x, s], [x, 0]]];
+  const feat = (b, f, n, x) => ({ type: 'Feature', properties: { spaceId: `${b}/${f}/${n}`, buildingId: b, floorId: f, classNumber: n }, geometry: { type: 'MultiPolygon', coordinates: [sq(x)] } });
+  const calls = [];
+  const base = {
+    frame: 'planar-cm',
+    load: async () => ({
+      buildingIndex: { buildings: [
+        { buildingId: 'D1', floorIds: ['1F', '2F', 'R1'] },
+        { buildingId: 'D2', floorIds: ['B1', '1F', '2F', '3F'] },
+        { buildingId: 'X', floorIds: ['1F'] },
+      ] },
+      buildingsData: { type: 'FeatureCollection', features: [
+        { type: 'Feature', properties: { buildingId: 'D1' }, geometry: { type: 'MultiPolygon', coordinates: [sq(0, 500)] } },
+        { type: 'Feature', properties: { buildingId: 'D2' }, geometry: { type: 'Polygon', coordinates: sq(1000, 500) } },
+      ] },
+      buildings: { D1: { name: '一' }, D2: { name: '二' }, X: { name: 'X' } },
+    }),
+    floor: async (b, f) => { calls.push(`${b}/${f}`); return { type: 'FeatureCollection', features: [feat(b, f, b === 'D1' ? '101' : '201', b === 'D1' ? 0 : 1000)] }; },
+  };
+  const src = mergeBuildings(base, { D1: ['D2'] });
+  assert.equal(src.frame, 'planar-cm');
+  const data = await src.load();
+  assert.deepEqual(data.buildingIndex.buildings.map(b => [b.buildingId, b.floorIds]), [['D1', ['B1', '1F', '2F', '3F', 'R1']], ['X', ['1F']]]);
+  assert.equal(data.buildingsData.features.find(f => f.properties.buildingId === 'D1').geometry.coordinates.length, 2);
+  const f1 = await src.floor('D1', '1F');
+  assert.deepEqual(f1.features.map(f => [f.properties.buildingId, f.properties.spaceId, f.properties.sourceBuildingId]),
+    [['D1', 'D1/1F/101', undefined], ['D1', 'D2/1F/201', 'D2']]);
+  // only members that have the floor are asked for it
+  calls.length = 0;
+  assert.equal((await src.floor('D1', 'R1')).features.length, 1);
+  assert.equal((await src.floor('D1', 'B1')).features[0].properties.sourceBuildingId, 'D2');
+  assert.deepEqual(calls, ['D1/R1', 'D2/B1']);
+  // other buildings pass through
+  assert.equal((await src.floor('X', '1F')).features[0].properties.buildingId, 'X');
+});

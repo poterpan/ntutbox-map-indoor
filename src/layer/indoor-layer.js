@@ -3,7 +3,7 @@ import { allCoords, createProjector, geoBounds } from '../data/frame.js';
 import {
   DEFAULT_BUILDINGS, classifyFeature, loadCampus, roomKey, roomSignature, roomStatus, sortedFloorIds, statsForFloor, toOccupancyMap,
 } from '../data/indoor.js';
-import { DEFAULT_PALETTE, buildFloor, disposeTree, extrudeUp, fillMaterial, paintRanges, statusColors } from './geometry.js';
+import { DEFAULT_PALETTE, buildFloor, disposeTree, extrudeUp, fillMaterial, outlineObject, paintRanges, statusColors } from './geometry.js';
 import { clampWindow, elevation as elevationOf, floorLayout, floorRunLabel, groundIndex, inplaceLayout, overviewIds, stackLayout } from './layout.js';
 
 // IndoorLayer: the indoor floors of one or more buildings as a THREE.Group plus the state machine that lays
@@ -48,11 +48,24 @@ export function createIndoorLayer(options = {}) {
     spaceLabel: null,
     spaceClass: null,
     spaceWalls: null,
+    slab: 'footprint',
+    slabFootprintFloors: null,
     badgeAnchor: 'middle',
     hoverStyle: null,
     ...options,
   };
   const GROUPING = typeof opts.stackFloors === 'function' ? opts.stackFloors : null;
+  if (!['footprint', 'spaces'].includes(opts.slab)) throw new TypeError(`createIndoorLayer: slab must be 'footprint' or 'spaces'`);
+  // slab: 'spaces' needs the polygon module (clipper), loaded only then.
+  let slabMod = null, slabModP = null;
+  const slabModule = () => (opts.slab !== 'spaces' ? Promise.resolve(null)
+    : (slabModP ??= import('./slabs.js').then(m => { slabMod = m; return m; }, err => { slabModP = null; throw err; })));
+  const keepFootprint = (b, f) => {
+    const x = opts.slabFootprintFloors;
+    if (!x) return false;
+    if (typeof x === 'function') return !!hook('slabFootprintFloors', false, b, f);
+    return x.includes(`${b}/${f}`);
+  };
   if (!GROUPING && !['classrooms', 'all'].includes(opts.stackFloors)) throw new TypeError(`createIndoorLayer: stackFloors must be 'classrooms', 'all' or a function`);
   // 'all' and a grouping function lay the stack out as entries (one per floor, or host-grouped runs).
   const ENTRIES = GROUPING || opts.stackFloors === 'all';
@@ -150,7 +163,7 @@ export function createIndoorLayer(options = {}) {
     if (built.has(id)) return Promise.resolve();
     if (!loading.has(id)) {
       const gen = loadGen.get(id) ?? 0;
-      const p = fetchFloors(id).then(({ data, order, datas }) => {
+      const p = Promise.all([fetchFloors(id), slabModule()]).then(([{ data, order, datas }]) => {
         // unload(id) while the data was in flight cancels this load
         if (disposed || built.has(id) || (loadGen.get(id) ?? 0) !== gen) return;
         const rec = {
@@ -225,6 +238,7 @@ export function createIndoorLayer(options = {}) {
         spaceOf: f => spaces.get(f) || null,
         ...(opts.spaceClass ? { classify: p => clsOf.get(p) ?? classifyFeature(p, occupancy) } : {}),
         ...(opts.spaceLabel ? { labelFor: info => hook('spaceLabel', null, info) } : {}),
+        ...(slabMod && !keepFootprint(rec.id, floorId) ? { slabPlates: (polys, area, overflows) => slabMod.slabPlatesFor(polys, area, undefined, overflows) } : {}),
         ...(opts.spaceWalls ? { wallsFor: f => { const info = spaces.get(f); return !!info && !!hook('spaceWalls', false, info); } } : {}),
       });
       floor.stats = statsForFloor(features, rec.id, floorId, occupancy);
@@ -610,11 +624,11 @@ export function createIndoorLayer(options = {}) {
       if (Math.abs(k - target) < .01) k = target;
       f.hoverK = k;
       if (k !== target) moving = true;
-      if (HS.outline !== false && f.outlinePoints?.length) {
+      if (HS.outline !== false && f.outlineLoops?.length) {
         if (!f.hoverEdge && k > 0) {
           const mat = new THREE.LineBasicMaterial({ color: COLORS.accent, transparent: true, opacity: 0, depthWrite: false });
           mat.fog = fog;
-          f.hoverEdge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(f.outlinePoints.map(p => new THREE.Vector3(p.x, .22, -p.y))), mat);
+          f.hoverEdge = outlineObject(f.outlineLoops, .22, mat);
           f.hoverEdge.renderOrder = 4 + RO;
           f.group.add(f.hoverEdge);
         }
@@ -714,6 +728,11 @@ export function createIndoorLayer(options = {}) {
   function floorOutline(id, floorId) {
     const f = built.get(id)?.floors.get(floorId);
     return f?.outlinePoints ? f.outlinePoints.map(p => [p.x, -p.y]) : [];
+  }
+  // Every slab plate's outline (slab: 'spaces' may give several; the first is the largest = floorOutline).
+  function floorOutlines(id, floorId) {
+    const f = built.get(id)?.floors.get(floorId);
+    return f?.outlineLoops ? f.outlineLoops.map(l => l.map(p => [p.x, -p.y])) : [];
   }
 
   // Floors (not entries) outside a stack window, below or above it.
@@ -973,6 +992,7 @@ export function createIndoorLayer(options = {}) {
     outlinePoints,
     stackEntries,
     floorOutline,
+    floorOutlines,
     room,
     space,
     spaces,

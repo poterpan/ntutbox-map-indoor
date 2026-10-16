@@ -119,6 +119,8 @@ createIndoorLayer({
   spaceLabel?: (space: SpaceInfo) => { text, priority?, kind?, fadeIn? } | null,  // 取代預設標籤（正門除外），每個 key 一個
   spaceClass?: (space: SpaceInfo) => SpaceClass | null,  // 改畫法；'room'＝具名地點：place 色、教室高度、邊線（不加矮牆）
   badgeAnchor?: 'middle' | 'near',             // 透視宿主用 near：徽章在總覽靠相機那側，不壓到下面的樓層
+  slab?: 'footprint' | 'spaces',               // 樓板：預設建築輪廓（或超出輪廓的樓層的凸包）；spaces＝由空間組成（見下「樓板」）
+  slabFootprintFloors?: string[] | (b, f) => boolean,  // slab 'spaces' 時仍用輪廓的樓層（資料只有一部分的層）
   spaceWalls?: (space: SpaceInfo) => boolean,  // 哪些空間圍矮牆；預設只有教室（排課站像素不變）。找路宿主可以給所有能選的地點
   hoverStyle?: { fade?, outline?, lift? },     // 整棟 hover 強調：其他層淡到 fade、該層 accent 外框＋浮起 lift×stackGap、
                                                // 畫在淡化層之後（完整不透明）、徽章 kind 加 ' hover'。null＝排課站原樣（其他層 .28）
@@ -161,6 +163,30 @@ layer.stackEntries(id): StackEntry[]   // { id（畫出來的那層）, floors, 
   標籤多兩個「下面還有 N 層」／「上面還有 N 層」（role `badge`、kind `more`、`more: 'below' | 'above'`、沒有 floor；N 是樓層數不是格數），
   宿主可以讓它點了就捲。
 - 視窗大小、何時開、怎麼捲（拖曳、滾輪、樓層軌）都是宿主決定。
+
+## 樓板（0.13，2026-10-16）
+
+預設（`slab: 'footprint'`）一層一塊：建築輪廓，樓層超出輪廓時用該層空間的凸包。分開的側翼（綜科 7F／8F 三塊各自有樓梯電梯）
+會被連成一片，空間只佔一小部分的樓層（先鋒 2F）是一大片空板。`slab: 'spaces'`（opt-in）：
+
+- 每層取所有畫出來的空間的聯集，先擴 0.5 m 再縮 0.5 m（1 m 以下的縫：牆、柱子不是空間），**不用凸包**。
+- 洞小於 12 m² 補起來（採光井、柱間、沒畫的小間），大的留著（中庭）；聯集裡每一塊各是一片樓板，**小的獨立房間（屋頂機房）
+  也是自己的一小片**；只丟掉小於 2 m² 的碎片（柱子、雜訊多邊形）。
+- 只在「這層分成好幾塊」「空間佔原本樓板不到 60%」或「空間超出建築輪廓」（預設會用凸包；這個模式**任何樓層都不用凸包**，2026-10-16 使用者同意）時改用；其他樓層跟預設完全一樣。`slabFootprintFloors` 指定仍用輪廓（或凸包）的樓層，優先於以上規則。
+- 外框、焦點邊線、hover 外框畫每一塊；`floorOutline` 是最大那塊（宿主的徽章貼它），`floorOutlines` 是全部。拾取照舊逐片。
+- 多邊形運算用 `@countertype/clipper2-ts`（Clipper2 的 TS 版，BSL-1.0），只有 `slab: 'spaces'` 才動態載入。
+  GIS 環有幾 cm² 的細縫洞（A6T B2 有十個），一起裁剪會讓 clipper 卡死：小於 0.1 m² 的環先丟掉。全校 228 層平均每層 1.1 ms（最多 8 ms）。
+
+## 合併建築（0.13，2026-10-16）
+
+`mergeBuildings(source, { B1D: ['B1D', 'B2D'] })` 包住任何資料來源，讓好幾棟室內資料當成一棟（地圖站的一宿＋二宿：
+模型與校園輪廓是一棟，室內資料分兩棟）。不改 layer：
+
+- 目標那棟的樓層清單取聯集（`floorRank` 排序），每層含所有有那層的成員的空間；其他成員從 building index 拿掉。
+- 樓層用 id 對齊，所以成員的同名樓層在同一高度（一宿 R1 會排在二宿 12F 之上，即使實際高度不同）。
+- 併進來的空間保留原本的 `spaceId`（`B2D/3F/2301`，宿主靠它分辨是哪一棟），`buildingId` 改成目標、另加 `sourceBuildingId`。
+  地點鍵是「目標/樓層/房號」：同一層兩棟有同房號會撞鍵，只合併房號不重複的建築。
+- 目標的校園輪廓加上成員的輪廓（直接串接，不做聯集，所以不應重疊）。
 
 ## Overlay API
 

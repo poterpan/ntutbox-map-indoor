@@ -5,5 +5,5 @@ export { createIndoorMap } from './viewer/indoor-map.js';
 export { createIndoorLayer } from './layer/indoor-layer.js';
 export { createLabelOverlay, defaultLabelClass } from './overlay/label-overlay.js';
 export { floorRank, ROOM_STATUSES } from './data/indoor.js';
-export { campusCdnSource, convertBuildings, convertFloor, CAMPUS_SCHEMA_VERSION } from './data/sources.js';
+export { campusCdnSource, mergeBuildings, convertBuildings, convertFloor, CAMPUS_SCHEMA_VERSION } from './data/sources.js';
 export { campusModelSource, MODELS_SCHEMA_VERSION } from './data/models.js';

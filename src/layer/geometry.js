@@ -278,7 +278,8 @@ function mergeLines(geoms) {
 //   classify(p) → space class ('room' = a named place: raised fill + edges in the `place` colour, no low walls);
 //   spaceOf(feature) → { key, selectable, … } (SpaceInfo); selectable spaces get a key, tint and outline;
 //   labelFor(info, cls) → { text, priority?, kind?, fadeIn? } | null, replacing the default labels;
-//   wallsFor(feature, cls) → bool: low walls around this space (default: classrooms only).
+//   wallsFor(feature, cls) → bool: low walls around this space (default: classrooms only);
+//   slabPlates(polygons, usualSlabArea, overflows) → plates | null: slab plates from the spaces (slab: 'spaces', see slabs.js).
 // floor.pieces: one entry per drawn polygon { feature, cls, kind?, base?, key, space, slab?, mesh: 'base'|'cast',
 // ranges, box (floor-local), shape, depth, y }; floor.meshes: { base, cast, walls, edges, spaceEdges } (absent
 // when empty); floor.proxy: the pick proxy (userData.pieces: triangle → index into floor.pieces).
@@ -289,7 +290,7 @@ export function buildFloor(ctx) {
   const group = new THREE.Group();
   group.userData.floorId = id;
   const floor = {
-    id, index: ctx.index, group, hull: null, outlinePoints: null,
+    id, index: ctx.index, group, hull: null, outlinePoints: null, outlineLoops: [], slabMode: 'footprint',
     pieces: [], meshes: {}, proxy: null, drawables: [], casters: [], labels: [], mats: [], fills: [], spaceEdges: [],
     wallScale: null, fade: 0, fadeTarget: 0, outline: null, outlineFade: 0, outlineTarget: 0, focusEdge: null, focusStyleK: undefined,
     localBox: null, badge: null,
@@ -444,8 +445,27 @@ export function buildFloor(ctx) {
   // back to the convex hull of their own spaces.
   floor.hull = slabOutline(features, ctx.footprintM, classify, project);
   const slab = slabPiece(floor.hull, ctx.footprintFeature, project);
-  if (slab) {
+  // Host option slab: 'spaces' (ctx.slabPlates): one plate per connected part of the spaces when the floor splits,
+  // or when its spaces cover too little of the usual slab (先鋒 2F); docs/LAYER.md「樓板」. Otherwise as above.
+  // A floor that overflows the footprint (usual slab = convex hull) always takes the plates: no hull in 'spaces' mode.
+  const plates = slab && ctx.slabPlates ? ctx.slabPlates(spacePolygons(features, classify, project), slab.area, !!floor.hull) : null;
+  floor.slabMode = plates ? 'spaces' : 'footprint';
+  if (plates) {
+    floor.outlineLoops = [];
+    plates.forEach((pl, i) => {
+      const shape = shapeFromPoints(pl.outer);
+      for (const h of pl.holes) shape.holes.push(shapeFromPoints(h, true));
+      const piece = extrudeSlab(shape);
+      if (i === 0) floor.outlinePoints = piece.outlinePoints;
+      floor.outlineLoops.push(piece.outlinePoints);
+      floor.pieces.push(piece.piece);
+      parts.base.push({ geom: piece.geom, top: COLORS.slabTop, side: COLORS.slabSide, piece: piece.piece });
+    });
+    // Ground points of every plate (stack framing, badge anchors).
+    floor.hull = plates.flatMap(pl => pl.outer);
+  } else if (slab) {
     floor.outlinePoints = slab.outlinePoints;
+    floor.outlineLoops = [slab.outlinePoints];
     floor.pieces.push(slab.piece);
     parts.base.push({ geom: slab.geom, top: COLORS.slabTop, side: COLORS.slabSide, piece: slab.piece });
   }
@@ -492,18 +512,12 @@ export function buildFloor(ctx) {
   // Outline-only ghost, kept outside the floor group so it can show while the fill is hidden.
   const outlinePts = floor.outlinePoints;
   if (outlinePts?.length) {
-    const line = new THREE.LineLoop(
-      new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .08, -p.y))),
-      lineMat({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }),
-    );
+    const line = outlineObject(floor.outlineLoops, .08, lineMat({ color: COLORS.outline, transparent: true, opacity: 0, depthWrite: false }));
     line.renderOrder = 1;
     line.visible = false;
     floor.outline = line;
     // Outer edge of the focused floor, above the room fills, below the walls.
-    const edge = new THREE.LineLoop(
-      new THREE.BufferGeometry().setFromPoints(outlinePts.map(p => new THREE.Vector3(p.x, .2, -p.y))),
-      lineMat({ color: COLORS.focusEdge, transparent: true, opacity: 0, depthWrite: false }),
-    );
+    const edge = outlineObject(floor.outlineLoops, .2, lineMat({ color: COLORS.focusEdge, transparent: true, opacity: 0, depthWrite: false }));
     edge.renderOrder = 3;
     edge.visible = false;
     group.add(edge);
@@ -559,10 +573,37 @@ function slabPiece(hull, footprintFeature, project) {
     }
   }
   if (!shape) return null;
+  const pts = shape.getPoints();
+  const area = Math.abs(THREE.ShapeUtils.area(pts)) - shape.holes.reduce((a, h) => a + Math.abs(THREE.ShapeUtils.area(h.getPoints())), 0);
+  return { ...extrudeSlab(shape), area };
+}
+
+function extrudeSlab(shape) {
   const geom = extrudeUp(shape, { depth: SLAB_DEPTH, bevelEnabled: true, bevelSize: .05, bevelThickness: .03, bevelSegments: 1 })
     .translate(0, .06 - SLAB_DEPTH, 0);
   geom.computeBoundingBox();
   return { geom, outlinePoints: shape.getPoints(), piece: { slab: true, mesh: 'base', ranges: null, box: geom.boundingBox.clone() } };
+}
+
+// One closed loop: a LineLoop (as always); several plates: LineSegments of every loop. loops: plan Vector2 points.
+export function outlineObject(loops, y, material) {
+  if (loops.length === 1) return new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(loops[0].map(p => new THREE.Vector3(p.x, y, -p.y))), material);
+  const pts = [];
+  for (const loop of loops) for (let i = 0; i < loop.length; i++) {
+    const a = loop[i], b = loop[(i + 1) % loop.length];
+    pts.push(new THREE.Vector3(a.x, y, -a.y), new THREE.Vector3(b.x, y, -b.y));
+  }
+  return new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), material);
+}
+
+// Drawn spaces as polygons [[outer [x, z][], ...holes]] in the layer frame (input of slabs.js).
+function spacePolygons(features, classify, project) {
+  const out = [];
+  for (const f of features) {
+    if (['skip', 'void'].includes(classify(f.properties))) continue;
+    for (const rings of ringsFromGeometry(f.geometry)) out.push(rings.map(r => r.map(pt => project(pt))));
+  }
+  return out;
 }
 
 function slabOutline(features, footprintM, classify, project) {
