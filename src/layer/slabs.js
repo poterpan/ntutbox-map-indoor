@@ -66,10 +66,11 @@ export function spacePlates(polygons, o = SLAB_SPACES) {
   return { plates, area: plates.reduce((s, p) => s + p.area, 0) };
 }
 
-// The rule: the spaces' plates replace the usual slab (footprint, or hull) when the floor splits into several
-// plates, or when they cover less than coverageBelow of it. Returns the plates, or null to keep the usual slab.
-export function slabPlatesFor(polygons, usualArea, o = SLAB_SPACES) {
+// The rule: the spaces' plates replace the usual slab when the floor splits into several plates, when they cover
+// less than coverageBelow of it, or always when the floor overflows the footprint (the usual slab would be a convex
+// hull: never in 'spaces' mode). Returns the plates, or null to keep the footprint.
+export function slabPlatesFor(polygons, usualArea, o = SLAB_SPACES, overflows = false) {
   const { plates, area } = spacePlates(polygons, o);
   if (!plates.length) return null;
-  return plates.length > 1 || area < o.coverageBelow * usualArea ? plates : null;
+  return overflows || plates.length > 1 || area < o.coverageBelow * usualArea ? plates : null;
 }

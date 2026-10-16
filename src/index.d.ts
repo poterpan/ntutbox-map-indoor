@@ -410,8 +410,9 @@ export interface IndoorLayerOptions<O extends HasStatus = OccupancyRecord> {
   /** Low walls around this space (any drawn space). Default: classrooms only. Evaluated at build time. */
   spaceWalls?: (space: SpaceInfo) => boolean;
   /** Floor slabs. 'footprint' (default): the building footprint, or the hull of a floor that does not fit it.
-   *  'spaces': a floor whose spaces split into separate parts, or cover less than 60 % of that slab, gets one plate
-   *  per part, shaped by the spaces themselves (gaps under 1 m closed, courtyards kept, < 2 m² slivers dropped).
+   *  'spaces': a floor whose spaces split into separate parts, cover less than 60 % of that slab, or overflow the
+   *  footprint (no hulls in this mode), gets one plate per part, shaped by the spaces themselves (gaps under 1 m
+   *  closed, courtyards kept, < 2 m² slivers dropped). slabFootprintFloors wins over all of these.
    *  Loads a small polygon module (~25 KB gzip) on first use. */
   slab?: 'footprint' | 'spaces';
   /** slab 'spaces': floors that keep the footprint slab anyway (partial data): "B/F" ids, or a predicate. */

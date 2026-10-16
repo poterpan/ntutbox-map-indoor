@@ -238,7 +238,7 @@ export function createIndoorLayer(options = {}) {
         spaceOf: f => spaces.get(f) || null,
         ...(opts.spaceClass ? { classify: p => clsOf.get(p) ?? classifyFeature(p, occupancy) } : {}),
         ...(opts.spaceLabel ? { labelFor: info => hook('spaceLabel', null, info) } : {}),
-        ...(slabMod && !keepFootprint(rec.id, floorId) ? { slabPlates: (polys, area) => slabMod.slabPlatesFor(polys, area) } : {}),
+        ...(slabMod && !keepFootprint(rec.id, floorId) ? { slabPlates: (polys, area, overflows) => slabMod.slabPlatesFor(polys, area, undefined, overflows) } : {}),
         ...(opts.spaceWalls ? { wallsFor: f => { const info = spaces.get(f); return !!info && !!hook('spaceWalls', false, info); } } : {}),
       });
       floor.stats = statsForFloor(features, rec.id, floorId, occupancy);

@@ -634,7 +634,7 @@ test('spaceWalls hook: classrooms only by default; a host can wall other spaces;
 
 // slab: 'spaces' (docs/LAYER.md「樓板」). A 40 m × 20 m building whose floors exercise the rule.
 function slabSource() {
-  const doc = { ...buildingsDoc, buildings: [{ ...buildingsDoc.buildings[0], floors: ['1F', '2F', '3F', '5F', '6F'] }] };
+  const doc = { ...buildingsDoc, buildings: [{ ...buildingsDoc.buildings[0], floors: ['1F', '2F', '3F', '5F', '6F', '7F', '8F'] }] };
   const campus = convertBuildings(doc);
   const sp = (id, g, t = '辦公室') => ({ id: `TB/${id}`, c: '005', t, g: [g] });
   const FL = {
@@ -648,6 +648,10 @@ function slabSource() {
     '5F': [sp('5F/n', rect(0, 0, 4000, 500)), sp('5F/s', rect(0, 1500, 4000, 500)), sp('5F/w', rect(0, 500, 1000, 1000)), sp('5F/e', rect(3000, 500, 1000, 1000)), sp('5F/p', rect(1800, 900, 400, 200))],
     // partial data: 10 m × 10 m of a 40 m × 20 m floor
     '6F': [sp('6F/a', rect(0, 0, 1000, 1000))],
+    // overflows the footprint by 5 m (the default slab is then a convex hull): the plates follow the spaces
+    '7F': [sp('7F/a', rect(0, 0, 4000, 2000)), sp('7F/x', rect(4000, 0, 500, 500))],
+    // the same overflow on the exception list: the default (hull) stays
+    '8F': [sp('8F/a', rect(0, 0, 4000, 2000)), sp('8F/x', rect(4000, 0, 500, 500))],
   };
   return { frame: 'planar-cm', load: async () => campus, floor: async (id, f) => (FL[f] ? convertFloor({ schema_version: 1, building: 'TB', floor: f, spaces: FL[f] }) : null) };
 }
@@ -657,7 +661,7 @@ test('slab spaces: split → one plate each, small room its own plate, sliver dr
   const area = loop => { let a = 0; for (let i = 0; i < loop.length; i++) { const [x1, z1] = loop[i], [x2, z2] = loop[(i + 1) % loop.length]; a += x1 * z2 - x2 * z1; } return Math.abs(a) / 2; };
   const plain = make2();
   await plain.load('TB');
-  const L = make2({ slab: 'spaces', slabFootprintFloors: ['TB/6F'] });
+  const L = make2({ slab: 'spaces', slabFootprintFloors: ['TB/6F', 'TB/8F'] });
   await L.load('TB');
   const plates = f => L.floorOutlines('TB', f).map(area).map(a => Math.round(a * 10) / 10);
   assert.deepEqual(L.floorOutlines('TB', '1F'), plain.floorOutlines('TB', '1F'), 'a fully covered floor keeps the footprint slab');
@@ -666,6 +670,9 @@ test('slab spaces: split → one plate each, small room its own plate, sliver dr
   assert.deepEqual(plates('5F').length, 2, 'courtyard ring + the pavilion in it');
   assert.equal(plates('6F').length, 1);
   assert.deepEqual(L.floorOutlines('TB', '6F'), plain.floorOutlines('TB', '6F'), 'exception list: the footprint stays');
+  assert.ok(Math.round(area(plain.floorOutline('TB', '7F'))) > 825, 'default: the overflowing floor is a convex hull');
+  assert.deepEqual(plates('7F'), [825], 'spaces: an overflowing floor is the union of its spaces, never a hull');
+  assert.deepEqual(L.floorOutlines('TB', '8F'), plain.floorOutlines('TB', '8F'), 'exception list wins over the overflow rule');
   // The courtyard stays open: a ray into it misses the slab; the corridor and the pavilion are hit.
   await L.setPresentation({ building: 'TB', mode: 'floor', floor: '5F', focusY: 0, floorGap: 3.2 });
   L.update(1 / 60);

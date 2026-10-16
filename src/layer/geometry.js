@@ -279,7 +279,7 @@ function mergeLines(geoms) {
 //   spaceOf(feature) → { key, selectable, … } (SpaceInfo); selectable spaces get a key, tint and outline;
 //   labelFor(info, cls) → { text, priority?, kind?, fadeIn? } | null, replacing the default labels;
 //   wallsFor(feature, cls) → bool: low walls around this space (default: classrooms only);
-//   slabPlates(polygons, usualSlabArea) → plates | null: slab plates from the spaces (slab: 'spaces', see slabs.js).
+//   slabPlates(polygons, usualSlabArea, overflows) → plates | null: slab plates from the spaces (slab: 'spaces', see slabs.js).
 // floor.pieces: one entry per drawn polygon { feature, cls, kind?, base?, key, space, slab?, mesh: 'base'|'cast',
 // ranges, box (floor-local), shape, depth, y }; floor.meshes: { base, cast, walls, edges, spaceEdges } (absent
 // when empty); floor.proxy: the pick proxy (userData.pieces: triangle → index into floor.pieces).
@@ -447,7 +447,8 @@ export function buildFloor(ctx) {
   const slab = slabPiece(floor.hull, ctx.footprintFeature, project);
   // Host option slab: 'spaces' (ctx.slabPlates): one plate per connected part of the spaces when the floor splits,
   // or when its spaces cover too little of the usual slab (先鋒 2F); docs/LAYER.md「樓板」. Otherwise as above.
-  const plates = slab && ctx.slabPlates ? ctx.slabPlates(spacePolygons(features, classify, project), slab.area) : null;
+  // A floor that overflows the footprint (usual slab = convex hull) always takes the plates: no hull in 'spaces' mode.
+  const plates = slab && ctx.slabPlates ? ctx.slabPlates(spacePolygons(features, classify, project), slab.area, !!floor.hull) : null;
   floor.slabMode = plates ? 'spaces' : 'footprint';
   if (plates) {
     floor.outlineLoops = [];
